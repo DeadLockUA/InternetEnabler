@@ -1,5 +1,10 @@
 # Agent Guidelines
 
+## 0. Project Context
+- InternetEnabler: family tool to schedule/toggle a son's internet access via Windows Firewall rules.
+- Two components, LAN-only, server → client HTTP commands secured by a shared token: `client` (runs on son's PC, tray icon, firewall control) and `server` (CLI on parent's PC).
+- Trust-based, not security-hardened: local admin on the client can always bypass it. Don't over-engineer security here.
+
 ## 1. Core Persona & Rules
 - Language: English only.
 - Prefix every response with: "The M:"
