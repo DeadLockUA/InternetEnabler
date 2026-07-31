@@ -1,5 +1,6 @@
 {
     "token": "CHANGE_ME_SHARED_SECRET",
     "port": 5987,
-    "lan_subnet": "192.168.1.0/24"
+    "lan_subnet": "192.168.1.0/24",
+    "reminder_minutes": 15
 }

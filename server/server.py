@@ -8,6 +8,9 @@ Usage:
     python server.py unblock
     python server.py set-schedule 20:30 21:00
     python server.py set-schedule --clear
+    python server.py set-tasks "Homework" "Clean room" "Walk dog"
+    python server.py get-tasks
+    python server.py history --days 30
 """
 
 import argparse
@@ -56,6 +59,14 @@ def main():
     sched.add_argument("times", nargs="*", help="e.g. 20:30 21:00")
     sched.add_argument("--clear", action="store_true", help="Clear the schedule")
 
+    tasks_parser = sub.add_parser("set-tasks", help="Set the son's task list")
+    tasks_parser.add_argument("tasks", nargs="*", help='e.g. "Homework" "Clean room"')
+
+    sub.add_parser("get-tasks", help="Show the son's task list and completion status")
+
+    hist_parser = sub.add_parser("history", help="Show task completion history")
+    hist_parser.add_argument("--days", type=int, default=30, help="How many days back (default 30)")
+
     args = parser.parse_args()
     config = load_config()
 
@@ -75,6 +86,26 @@ def main():
                 sys.exit(f"Invalid time format: {t!r}, expected HH:MM")
         result = request(config, "POST", "/schedule", {"times": times})
         print(f"Schedule set: {result['times']}")
+    elif args.command == "set-tasks":
+        result = request(config, "POST", "/tasks", {"tasks": args.tasks})
+        print(f"Tasks set: {[t['text'] for t in result['tasks']]}")
+    elif args.command == "get-tasks":
+        result = request(config, "GET", "/tasks")
+        tasks = result.get("tasks", [])
+        if not tasks:
+            print("No tasks assigned.")
+        else:
+            for t in tasks:
+                mark = "x" if t.get("done") else " "
+                print(f"[{mark}] {t['text']}")
+    elif args.command == "history":
+        result = request(config, "GET", f"/history?days={args.days}")
+        entries = result.get("entries", [])
+        if not entries:
+            print("No history.")
+        else:
+            for e in entries:
+                print(f"{e['timestamp']}  {e['event']:>9}  {e['task']}")
 
 
 if __name__ == "__main__":

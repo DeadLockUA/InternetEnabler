@@ -1,7 +1,7 @@
 """InternetEnabler client agent.
 
 Runs in the background (tray icon), enforces a daily block schedule,
-and listens for block/unblock/schedule commands from the parent's server.
+and listens for block/unblock/schedule/task commands from the parent's server.
 """
 
 import json
@@ -9,8 +9,11 @@ import os
 import sys
 import threading
 import time
-from datetime import date, datetime
+import tkinter as tk
+from tkinter import messagebox, simpledialog
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 from PIL import Image, ImageDraw
 import pystray
@@ -20,14 +23,25 @@ import firewall
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 SCHEDULE_PATH = os.path.join(BASE_DIR, "schedule.json")
+TASKS_PATH = os.path.join(BASE_DIR, "tasks.json")
+HISTORY_PATH = os.path.join(BASE_DIR, "history.json")
+
+DEFAULT_REMINDER_MINUTES = 15
 
 _lock = threading.Lock()
-_fired_today = {}  # {"HH:MM": date} -> last date this schedule entry fired
+_fired_today = {}  # {"HH:MM": date} -> last date this schedule entry fired the block
+_reminder_fired_today = {}  # {"HH:MM": date} -> last date the reminder for this entry fired
+_icon_ref = {"icon": None}
 
 
 def load_config():
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def save_config(config):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=4)
 
 
 def load_schedule():
@@ -42,12 +56,89 @@ def save_schedule(times):
         json.dump({"times": times}, f, indent=4)
 
 
+def load_tasks():
+    if not os.path.exists(TASKS_PATH):
+        return []
+    with open(TASKS_PATH, "r", encoding="utf-8") as f:
+        return json.load(f).get("tasks", [])
+
+
+def save_tasks(tasks):
+    with open(TASKS_PATH, "w", encoding="utf-8") as f:
+        json.dump({"tasks": tasks}, f, indent=4)
+
+
+def reset_tasks_done():
+    tasks = load_tasks()
+    if not tasks:
+        return
+    for t in tasks:
+        t["done"] = False
+    save_tasks(tasks)
+
+
+def load_history():
+    if not os.path.exists(HISTORY_PATH):
+        return []
+    with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+        return json.load(f).get("entries", [])
+
+
+def append_history(task_text, event):
+    entries = load_history()
+    entries.append({
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "task": task_text,
+        "event": event,  # "completed" or "skipped"
+    })
+    with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+        json.dump({"entries": entries}, f, indent=4)
+
+
 def make_icon_image(blocked):
     color = (200, 40, 40) if blocked else (40, 170, 70)
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.ellipse((4, 4, 60, 60), fill=color)
     return img
+
+
+def _dialog_root():
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    return root
+
+
+def ask_yes_no(question):
+    root = _dialog_root()
+    try:
+        return messagebox.askyesno("InternetEnabler", question, parent=root)
+    finally:
+        root.destroy()
+
+
+def show_info(title, message):
+    root = _dialog_root()
+    try:
+        messagebox.showinfo(title, message, parent=root)
+    finally:
+        root.destroy()
+
+
+def ask_reminder_minutes(current):
+    root = _dialog_root()
+    try:
+        return simpledialog.askinteger(
+            "InternetEnabler",
+            "Remind me this many minutes before internet is blocked:",
+            initialvalue=current,
+            minvalue=0,
+            maxvalue=180,
+            parent=root,
+        )
+    finally:
+        root.destroy()
 
 
 class CommandHandler(BaseHTTPRequestHandler):
@@ -74,12 +165,28 @@ class CommandHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._send_json(401, {"error": "unauthorized"})
             return
-        if self.path == "/status":
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/status":
             with _lock:
                 blocked = firewall.is_blocked()
             self._send_json(200, {"blocked": blocked})
-        elif self.path == "/schedule":
+        elif path == "/schedule":
             self._send_json(200, {"times": load_schedule()})
+        elif path == "/tasks":
+            self._send_json(200, {"tasks": load_tasks()})
+        elif path == "/history":
+            qs = parse_qs(parsed.query)
+            try:
+                days = int(qs.get("days", ["30"])[0])
+            except ValueError:
+                days = 30
+            cutoff = datetime.now() - timedelta(days=days)
+            entries = [
+                e for e in load_history()
+                if datetime.fromisoformat(e["timestamp"]) >= cutoff
+            ]
+            self._send_json(200, {"entries": entries})
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -90,6 +197,7 @@ class CommandHandler(BaseHTTPRequestHandler):
         if self.path == "/block":
             with _lock:
                 firewall.enable_block()
+                reset_tasks_done()
             self._send_json(200, {"blocked": True})
         elif self.path == "/unblock":
             with _lock:
@@ -101,6 +209,18 @@ class CommandHandler(BaseHTTPRequestHandler):
                 times = body.get("times", [])
                 save_schedule(times)
                 self._send_json(200, {"times": times})
+            except (ValueError, KeyError):
+                self._send_json(400, {"error": "invalid body"})
+        elif self.path == "/tasks":
+            try:
+                body = self._read_json_body()
+                texts = body.get("tasks", [])
+                tasks = [
+                    {"id": i + 1, "text": text, "done": False}
+                    for i, text in enumerate(texts)
+                ]
+                save_tasks(tasks)
+                self._send_json(200, {"tasks": tasks})
             except (ValueError, KeyError):
                 self._send_json(400, {"error": "invalid body"})
         else:
@@ -121,10 +241,27 @@ def run_scheduler():
         now = datetime.now()
         current_time = now.strftime("%H:%M")
         today = date.today()
+        config = load_config()
+        reminder_minutes = config.get("reminder_minutes", DEFAULT_REMINDER_MINUTES)
         for entry in load_schedule():
+            entry_dt = datetime.strptime(entry, "%H:%M").replace(
+                year=now.year, month=now.month, day=now.day
+            )
+            reminder_time = (entry_dt - timedelta(minutes=reminder_minutes)).strftime("%H:%M")
+
+            if reminder_time == current_time and _reminder_fired_today.get(entry) != today:
+                icon = _icon_ref["icon"]
+                if icon is not None:
+                    try:
+                        icon.notify(f"Internet will be blocked at {entry}.", "InternetEnabler")
+                    except Exception:
+                        pass
+                _reminder_fired_today[entry] = today
+
             if entry == current_time and _fired_today.get(entry) != today:
                 with _lock:
                     firewall.enable_block()
+                    reset_tasks_done()
                 _fired_today[entry] = today
         time.sleep(20)
 
@@ -132,8 +269,42 @@ def run_scheduler():
 def run_tray(config):
     def on_enable(icon, item):
         with _lock:
+            already_unblocked = not firewall.is_blocked()
+        if already_unblocked:
+            return
+
+        tasks = load_tasks()
+        pending = [t for t in tasks if not t.get("done")]
+        for t in pending:
+            answered_yes = ask_yes_no(f"Was '{t['text']}' complete?")
+            if not answered_yes:
+                append_history(t["text"], "skipped")
+                show_info("InternetEnabler", "Finish your tasks first.")
+                return
+            t["done"] = True
+            save_tasks(tasks)
+            append_history(t["text"], "completed")
+
+        with _lock:
             firewall.disable_block()
         icon.icon = make_icon_image(False)
+
+    def on_view_tasks(icon, item):
+        tasks = load_tasks()
+        if not tasks:
+            show_info("Your Tasks", "No tasks assigned.")
+            return
+        lines = [f"[{'x' if t.get('done') else ' '}] {t['text']}" for t in tasks]
+        show_info("Your Tasks", "\n".join(lines))
+
+    def on_set_reminder(icon, item):
+        config = load_config()
+        current = config.get("reminder_minutes", DEFAULT_REMINDER_MINUTES)
+        minutes = ask_reminder_minutes(current)
+        if minutes is None:
+            return
+        config["reminder_minutes"] = minutes
+        save_config(config)
 
     def status_text(item):
         with _lock:
@@ -143,11 +314,14 @@ def run_tray(config):
     menu = pystray.Menu(
         pystray.MenuItem(status_text, None, enabled=False),
         pystray.MenuItem("Enable Internet", on_enable, default=True),
+        pystray.MenuItem("View Tasks", on_view_tasks),
+        pystray.MenuItem("Set Reminder Time...", on_set_reminder),
     )
 
     with _lock:
         initial_blocked = firewall.is_blocked()
     icon = pystray.Icon("InternetEnabler", make_icon_image(initial_blocked), "InternetEnabler", menu)
+    _icon_ref["icon"] = icon
 
     def refresh_loop():
         while True:

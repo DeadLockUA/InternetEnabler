@@ -16,6 +16,9 @@
 ## 3. Exception: Risky Actions
 - Before any destructive or hard-to-reverse action (delete, overwrite, force-push, drop data, etc.), state the reasoning and ask for confirmation — regardless of all brevity rules below.
 
+## 3a. Proposals & Questions
+- Whenever asking/proposing something (options, approaches, decisions), give a quick evaluation: benefits vs drawbacks, so the user can decide fast.
+
 ## 4. Token Saving & Output Restrictions
 - No pleasantries (no "Sure", "Here is...", "Hope this helps").
 - Do not restate the user's request back before answering.

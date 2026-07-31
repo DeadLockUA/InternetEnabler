@@ -16,9 +16,17 @@ can reach the son's computer, so all communication flows
   time). Blocks outgoing internet traffic through Windows Firewall, but
   doesn't touch traffic within the local network — so the server can still
   reach it even when internet is blocked. Tray icon (red = blocked,
-  green = OK) with an "Enable Internet" button.
+  green = OK) with:
+  - **Enable Internet** — if there are pending tasks, asks "Was '<task>'
+    complete?" one by one (Yes/No). Answering No stops immediately and
+    internet stays blocked. Internet is only enabled once every task is
+    confirmed done. Each block cycle resets tasks to not-done.
+  - **View Tasks** — shows the current task list and completion status.
+  - **Set Reminder Time...** — how many minutes before a scheduled block
+    a tray notification should warn the son.
 - **server** — a simple CLI on the parent's computer that sends commands
-  to the client over HTTP (protected by a shared secret token).
+  to the client over HTTP (protected by a shared secret token), including
+  assigning tasks and reviewing completion history.
 
 ## Setup
 
@@ -61,10 +69,18 @@ python server.py block
 python server.py unblock
 python server.py set-schedule 20:30 21:00
 python server.py set-schedule --clear
+python server.py set-tasks "Homework" "Clean room" "Walk dog"
+python server.py get-tasks
+python server.py history --days 30
 ```
 
 `set-schedule` sets the time(s) at which the client will enable the
 block itself — this works even if your computer is turned off.
+
+`set-tasks` replaces the son's full task list (resets completion status).
+`get-tasks` shows the current list and which are done. `history` shows a
+log of every task confirmation (completed or skipped) over the given
+number of days, e.g. for a monthly review.
 
 ## Important details
 
