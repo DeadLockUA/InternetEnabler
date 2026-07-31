@@ -6,12 +6,12 @@ and listens for block/unblock/schedule/task commands from the parent's server.
 
 import json
 import os
-import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 from tkinter import messagebox, simpledialog
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -27,10 +27,22 @@ TASKS_PATH = os.path.join(BASE_DIR, "tasks.json")
 HISTORY_PATH = os.path.join(BASE_DIR, "history.json")
 
 DEFAULT_REMINDER_MINUTES = 15
+HISTORY_RETENTION_DAYS = 400
+
+
+def is_valid_time(value):
+    if not isinstance(value, str) or len(value) != 5 or value[2] != ":":
+        return False
+    try:
+        datetime.strptime(value, "%H:%M")
+        return True
+    except ValueError:
+        return False
+
 
 _lock = threading.Lock()
 _fired_today = {}  # {"HH:MM": date} -> last date this schedule entry fired the block
-_reminder_fired_today = {}  # {"HH:MM": date} -> last date the reminder for this entry fired
+_reminder_fired = set()  # {("HH:MM", date)} -> reminder already fired for this occurrence
 _icon_ref = {"icon": None}
 
 
@@ -77,6 +89,15 @@ def reset_tasks_done():
     save_tasks(tasks)
 
 
+def mark_task_done(task_id):
+    """Reload tasks fresh and mark a single one done, under the caller's lock."""
+    tasks = load_tasks()
+    for t in tasks:
+        if t["id"] == task_id:
+            t["done"] = True
+    save_tasks(tasks)
+
+
 def load_history():
     if not os.path.exists(HISTORY_PATH):
         return []
@@ -91,6 +112,8 @@ def append_history(task_text, event):
         "task": task_text,
         "event": event,  # "completed" or "skipped"
     })
+    cutoff = datetime.now() - timedelta(days=HISTORY_RETENTION_DAYS)
+    entries = [e for e in entries if datetime.fromisoformat(e["timestamp"]) >= cutoff]
     with open(HISTORY_PATH, "w", encoding="utf-8") as f:
         json.dump({"entries": entries}, f, indent=4)
 
@@ -207,6 +230,9 @@ class CommandHandler(BaseHTTPRequestHandler):
             try:
                 body = self._read_json_body()
                 times = body.get("times", [])
+                if not all(is_valid_time(t) for t in times):
+                    self._send_json(400, {"error": "invalid time, expected HH:MM"})
+                    return
                 save_schedule(times)
                 self._send_json(200, {"times": times})
             except (ValueError, KeyError):
@@ -219,7 +245,8 @@ class CommandHandler(BaseHTTPRequestHandler):
                     {"id": i + 1, "text": text, "done": False}
                     for i, text in enumerate(texts)
                 ]
-                save_tasks(tasks)
+                with _lock:
+                    save_tasks(tasks)
                 self._send_json(200, {"tasks": tasks})
             except (ValueError, KeyError):
                 self._send_json(400, {"error": "invalid body"})
@@ -236,76 +263,101 @@ def run_http_server(config):
     server.serve_forever()
 
 
-def run_scheduler():
-    while True:
+def scheduler_tick(now=None):
+    """Run one scheduler check. Split out from run_scheduler so it's unit-testable
+    and so a single bad tick can't permanently kill the scheduler thread."""
+    if now is None:
         now = datetime.now()
-        current_time = now.strftime("%H:%M")
-        today = date.today()
-        config = load_config()
-        reminder_minutes = config.get("reminder_minutes", DEFAULT_REMINDER_MINUTES)
-        for entry in load_schedule():
-            entry_dt = datetime.strptime(entry, "%H:%M").replace(
-                year=now.year, month=now.month, day=now.day
-            )
-            reminder_time = (entry_dt - timedelta(minutes=reminder_minutes)).strftime("%H:%M")
+    current_time = now.strftime("%H:%M")
+    today = now.date()
+    config = load_config()
+    reminder_minutes = config.get("reminder_minutes", DEFAULT_REMINDER_MINUTES)
 
-            if reminder_time == current_time and _reminder_fired_today.get(entry) != today:
+    for entry in load_schedule():
+        if not is_valid_time(entry):
+            continue
+        entry_today = datetime.combine(today, datetime.strptime(entry, "%H:%M").time())
+
+        # Check both today's and tomorrow's occurrence so a reminder window that
+        # crosses midnight (e.g. a 00:10 block reminded 15 minutes earlier) still fires.
+        for occurrence in (entry_today, entry_today + timedelta(days=1)):
+            reminder_dt = occurrence - timedelta(minutes=reminder_minutes)
+            fire_key = (entry, occurrence.date())
+            if reminder_dt.strftime("%H:%M") == current_time and fire_key not in _reminder_fired:
                 icon = _icon_ref["icon"]
                 if icon is not None:
                     try:
                         icon.notify(f"Internet will be blocked at {entry}.", "InternetEnabler")
                     except Exception:
                         pass
-                _reminder_fired_today[entry] = today
+                _reminder_fired.add(fire_key)
 
-            if entry == current_time and _fired_today.get(entry) != today:
-                with _lock:
-                    firewall.enable_block()
-                    reset_tasks_done()
-                _fired_today[entry] = today
+        # >= (not ==) so a block time missed while the PC was off/asleep still
+        # fires as soon as the agent is running again, instead of being skipped for the day.
+        if current_time >= entry and _fired_today.get(entry) != today:
+            with _lock:
+                firewall.enable_block()
+                reset_tasks_done()
+            _fired_today[entry] = today
+
+
+def run_scheduler():
+    while True:
+        try:
+            scheduler_tick()
+        except Exception:
+            traceback.print_exc()
         time.sleep(20)
 
 
-def run_tray(config):
-    def on_enable(icon, item):
-        with _lock:
-            already_unblocked = not firewall.is_blocked()
-        if already_unblocked:
+def on_enable(icon, item):
+    """Enable-Internet tray action: gate on confirming every pending task.
+
+    Module-level (not a run_tray closure) so it's directly unit-testable.
+    """
+    with _lock:
+        already_unblocked = not firewall.is_blocked()
+    if already_unblocked:
+        return
+
+    tasks = load_tasks()
+    pending = [t for t in tasks if not t.get("done")]
+    for t in pending:
+        answered_yes = ask_yes_no(f"Was '{t['text']}' complete?")
+        if not answered_yes:
+            append_history(t["text"], "skipped")
+            show_info("InternetEnabler", "Finish your tasks first.")
             return
-
-        tasks = load_tasks()
-        pending = [t for t in tasks if not t.get("done")]
-        for t in pending:
-            answered_yes = ask_yes_no(f"Was '{t['text']}' complete?")
-            if not answered_yes:
-                append_history(t["text"], "skipped")
-                show_info("InternetEnabler", "Finish your tasks first.")
-                return
-            t["done"] = True
-            save_tasks(tasks)
-            append_history(t["text"], "completed")
-
         with _lock:
-            firewall.disable_block()
+            mark_task_done(t["id"])
+        append_history(t["text"], "completed")
+
+    with _lock:
+        firewall.disable_block()
+    if icon is not None:
         icon.icon = make_icon_image(False)
 
-    def on_view_tasks(icon, item):
-        tasks = load_tasks()
-        if not tasks:
-            show_info("Your Tasks", "No tasks assigned.")
-            return
-        lines = [f"[{'x' if t.get('done') else ' '}] {t['text']}" for t in tasks]
-        show_info("Your Tasks", "\n".join(lines))
 
-    def on_set_reminder(icon, item):
-        config = load_config()
-        current = config.get("reminder_minutes", DEFAULT_REMINDER_MINUTES)
-        minutes = ask_reminder_minutes(current)
-        if minutes is None:
-            return
-        config["reminder_minutes"] = minutes
-        save_config(config)
+def on_view_tasks(icon, item):
+    tasks = load_tasks()
+    if not tasks:
+        show_info("Your Tasks", "No tasks assigned.")
+        return
+    lines = [f"[{'x' if t.get('done') else ' '}] {t['text']}" for t in tasks]
+    show_info("Your Tasks", "\n".join(lines))
 
+
+def on_set_reminder(icon, item):
+    config = load_config()
+    current = config.get("reminder_minutes", DEFAULT_REMINDER_MINUTES)
+    minutes = ask_reminder_minutes(current)
+    if minutes is None:
+        return
+    config["reminder_minutes"] = minutes
+    save_config(config)
+
+
+def run_tray(config):
     def status_text(item):
         with _lock:
             blocked = firewall.is_blocked()

@@ -2,6 +2,7 @@ import http.client
 import json
 import threading
 import time
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -14,6 +15,9 @@ def isolated_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "SCHEDULE_PATH", str(tmp_path / "schedule.json"))
     monkeypatch.setattr(agent, "TASKS_PATH", str(tmp_path / "tasks.json"))
     monkeypatch.setattr(agent, "HISTORY_PATH", str(tmp_path / "history.json"))
+    agent._fired_today.clear()
+    agent._reminder_fired.clear()
+    agent._icon_ref["icon"] = None
     yield
 
 
@@ -58,6 +62,17 @@ def test_reset_tasks_done_noop_when_no_tasks_file():
     assert agent.load_tasks() == []
 
 
+def test_mark_task_done_marks_only_matching_id():
+    agent.save_tasks([
+        {"id": 1, "text": "A", "done": False},
+        {"id": 2, "text": "B", "done": False},
+    ])
+    agent.mark_task_done(2)
+    tasks = agent.load_tasks()
+    assert tasks[0]["done"] is False
+    assert tasks[1]["done"] is True
+
+
 def test_load_history_missing_file_returns_empty_list():
     assert agent.load_history() == []
 
@@ -71,6 +86,138 @@ def test_append_history_appends_entries():
     assert entries[0]["event"] == "completed"
     assert entries[1]["event"] == "skipped"
     assert "timestamp" in entries[0]
+
+
+def test_append_history_prunes_entries_older_than_retention():
+    old = (datetime.now() - timedelta(days=agent.HISTORY_RETENTION_DAYS + 10)).isoformat(timespec="seconds")
+    with open(agent.HISTORY_PATH, "w", encoding="utf-8") as f:
+        json.dump({"entries": [{"timestamp": old, "task": "Old", "event": "completed"}]}, f)
+
+    agent.append_history("New", "completed")
+
+    entries = agent.load_history()
+    assert [e["task"] for e in entries] == ["New"]
+
+
+# -- is_valid_time ------------------------------------------------------
+
+def test_is_valid_time_accepts_zero_padded_24h():
+    assert agent.is_valid_time("20:30") is True
+    assert agent.is_valid_time("00:00") is True
+    assert agent.is_valid_time("23:59") is True
+
+
+def test_is_valid_time_rejects_bad_input():
+    assert agent.is_valid_time("25:99") is False
+    assert agent.is_valid_time("8:30") is False
+    assert agent.is_valid_time("abcde") is False
+    assert agent.is_valid_time(123) is False
+    assert agent.is_valid_time(None) is False
+
+
+# -- on_enable ------------------------------------------------------------
+
+def test_on_enable_confirms_all_tasks_then_unblocks(monkeypatch):
+    agent.save_tasks([
+        {"id": 1, "text": "Homework", "done": False},
+        {"id": 2, "text": "Clean room", "done": False},
+    ])
+    monkeypatch.setattr(agent.firewall, "is_blocked", lambda: True)
+    disabled = []
+    monkeypatch.setattr(agent.firewall, "disable_block", lambda: disabled.append(1))
+    monkeypatch.setattr(agent, "ask_yes_no", lambda question: True)
+
+    agent.on_enable(None, None)
+
+    assert disabled == [1]
+    assert all(t["done"] for t in agent.load_tasks())
+    assert [e["event"] for e in agent.load_history()] == ["completed", "completed"]
+
+
+def test_on_enable_stops_on_no_and_keeps_blocked(monkeypatch):
+    agent.save_tasks([{"id": 1, "text": "Homework", "done": False}])
+    monkeypatch.setattr(agent.firewall, "is_blocked", lambda: True)
+    disabled = []
+    monkeypatch.setattr(agent.firewall, "disable_block", lambda: disabled.append(1))
+    monkeypatch.setattr(agent, "ask_yes_no", lambda question: False)
+    shown = []
+    monkeypatch.setattr(agent, "show_info", lambda title, message: shown.append(message))
+
+    agent.on_enable(None, None)
+
+    assert disabled == []
+    assert agent.load_tasks()[0]["done"] is False
+    assert agent.load_history()[0]["event"] == "skipped"
+    assert shown
+
+
+def test_on_enable_noop_when_already_unblocked(monkeypatch):
+    monkeypatch.setattr(agent.firewall, "is_blocked", lambda: False)
+    called = []
+    monkeypatch.setattr(agent, "ask_yes_no", lambda question: called.append(1))
+
+    agent.on_enable(None, None)
+
+    assert called == []
+
+
+# -- scheduler_tick ---------------------------------------------------------
+
+def test_scheduler_tick_ignores_invalid_schedule_entries():
+    agent.save_schedule(["25:99"])
+    agent.save_config({"token": "t", "port": 5987})
+    agent.scheduler_tick(datetime(2026, 1, 1, 12, 0))  # should not raise
+
+
+def test_scheduler_tick_fires_missed_schedule_and_only_once(monkeypatch):
+    agent.save_schedule(["08:00"])
+    agent.save_config({"token": "t", "port": 5987})
+    enabled = []
+    monkeypatch.setattr(agent.firewall, "enable_block", lambda: enabled.append(1))
+
+    agent.scheduler_tick(datetime(2026, 1, 1, 8, 5))  # PC was asleep at 08:00, woke up at 08:05
+    assert enabled == [1]
+
+    agent.scheduler_tick(datetime(2026, 1, 1, 8, 6))  # must not refire same day
+    assert enabled == [1]
+
+
+def test_scheduler_tick_reminder_crosses_midnight(monkeypatch):
+    agent.save_schedule(["00:10"])
+    agent.save_config({"token": "t", "port": 5987, "reminder_minutes": 15})
+    monkeypatch.setattr(agent.firewall, "enable_block", lambda: None)
+
+    class FakeIcon:
+        def __init__(self):
+            self.notified = []
+
+        def notify(self, message, title):
+            self.notified.append(message)
+
+    fake_icon = FakeIcon()
+    agent._icon_ref["icon"] = fake_icon
+
+    agent.scheduler_tick(datetime(2026, 1, 1, 23, 55))  # evening before the 00:10 block
+
+    assert any("00:10" in m for m in fake_icon.notified)
+
+
+def test_run_scheduler_survives_exception_from_tick(monkeypatch):
+    calls = []
+
+    def fake_tick(now=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        raise SystemExit  # stop the infinite loop once we've proven it kept going
+
+    monkeypatch.setattr(agent, "scheduler_tick", fake_tick)
+    monkeypatch.setattr(agent.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(SystemExit):
+        agent.run_scheduler()
+
+    assert len(calls) == 2
 
 
 # -- HTTP command handler ------------------------------------------------
@@ -165,6 +312,12 @@ def test_schedule_round_trip(server):
     status, payload = server.request("GET", "/schedule")
     assert status == 200
     assert payload == {"times": ["20:30", "21:00"]}
+
+
+def test_schedule_rejects_invalid_time(server):
+    status, payload = server.request("POST", "/schedule", body={"times": ["25:99"]})
+    assert status == 400
+    assert agent.load_schedule() == []
 
 
 def test_tasks_round_trip(server):

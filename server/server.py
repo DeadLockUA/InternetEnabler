@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime
 import urllib.request
 import urllib.error
 
@@ -84,6 +85,10 @@ def main():
         for t in times:
             if len(t) != 5 or t[2] != ":":
                 sys.exit(f"Invalid time format: {t!r}, expected HH:MM")
+            try:
+                datetime.strptime(t, "%H:%M")
+            except ValueError:
+                sys.exit(f"Invalid time: {t!r}, expected a valid 24h HH:MM")
         result = request(config, "POST", "/schedule", {"times": times})
         print(f"Schedule set: {result['times']}")
     elif args.command == "set-tasks":

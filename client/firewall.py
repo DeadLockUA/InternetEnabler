@@ -22,6 +22,22 @@ def _run(args):
     return result.returncode, result.stdout, result.stderr
 
 
+def _run_ps(command):
+    """Run a PowerShell expression and return (returncode, stripped stdout, stderr).
+
+    Used instead of parsing netsh's human-readable output, which is localized
+    (e.g. "Enabled: Yes" is not "Enabled: Yes" on a non-English Windows install)
+    and would silently misreport rule state on such a machine.
+    """
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    return result.returncode, result.stdout.strip(), result.stderr
+
+
 def _wan_ranges(lan_subnet):
     """Return the list of CIDR blocks covering 0.0.0.0/0 minus lan_subnet."""
     lan = ipaddress.ip_network(lan_subnet, strict=False)
@@ -32,14 +48,17 @@ def _wan_ranges(lan_subnet):
 
 
 def _rule_exists(name):
-    code, out, _ = _run(["advfirewall", "firewall", "show", "rule", f'name="{name}"'])
-    return code == 0 and "No rules match" not in out
+    code, out, _ = _run_ps(f"[bool](Get-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue)")
+    return code == 0 and out == "True"
 
 
 def ensure_rules(lan_subnet, port):
-    """Create the block and inbound-allow rules if they don't exist yet."""
+    """Create the block and inbound-allow rules if missing, or reconcile their
+    remoteip/port against the current config if they already exist (so editing
+    lan_subnet/port in config.json after first install takes effect on restart
+    instead of being silently ignored forever)."""
+    remote_ip = ",".join(_wan_ranges(lan_subnet))
     if not _rule_exists(BLOCK_RULE_NAME):
-        remote_ip = ",".join(_wan_ranges(lan_subnet))
         code, out, err = _run([
             "advfirewall", "firewall", "add", "rule",
             f'name="{BLOCK_RULE_NAME}"',
@@ -50,6 +69,13 @@ def ensure_rules(lan_subnet, port):
         ])
         if code != 0:
             raise RuntimeError(f"Failed to create block rule: {err or out}")
+    else:
+        code, out, err = _run([
+            "advfirewall", "firewall", "set", "rule",
+            f'name="{BLOCK_RULE_NAME}"', "new", f"remoteip={remote_ip}",
+        ])
+        if code != 0:
+            raise RuntimeError(f"Failed to update block rule: {err or out}")
 
     if not _rule_exists(INBOUND_RULE_NAME):
         code, out, err = _run([
@@ -63,6 +89,14 @@ def ensure_rules(lan_subnet, port):
         ])
         if code != 0:
             raise RuntimeError(f"Failed to create inbound rule: {err or out}")
+    else:
+        code, out, err = _run([
+            "advfirewall", "firewall", "set", "rule",
+            f'name="{INBOUND_RULE_NAME}"', "new",
+            f"localport={port}", f"remoteip={lan_subnet}",
+        ])
+        if code != 0:
+            raise RuntimeError(f"Failed to update inbound rule: {err or out}")
 
 
 def enable_block():
@@ -84,10 +118,5 @@ def disable_block():
 
 
 def is_blocked():
-    code, out, _ = _run(["advfirewall", "firewall", "show", "rule", f'name="{BLOCK_RULE_NAME}"'])
-    if code != 0:
-        return False
-    for line in out.splitlines():
-        if line.strip().startswith("Enabled:"):
-            return "Yes" in line
-    return False
+    code, out, _ = _run_ps(f"(Get-NetFirewallRule -DisplayName '{BLOCK_RULE_NAME}' -ErrorAction SilentlyContinue).Enabled")
+    return code == 0 and out == "True"

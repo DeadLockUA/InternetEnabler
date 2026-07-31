@@ -4,26 +4,38 @@
 # Removes the auto-start Scheduled Task and the Windows Firewall rules
 # created by install.ps1, and stops the running agent if any.
 
-$ErrorActionPreference = "SilentlyContinue"
+$ErrorActionPreference = "Stop"
 
 $taskName = "InternetEnablerAgent"
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Error "Please run this script from an elevated (Administrator) PowerShell window."
+    Write-Host "Please run this script from an elevated (Administrator) PowerShell window." -ForegroundColor Red
     exit 1
 }
 
 Write-Host "Stopping the agent (if running)..."
-Get-Process pythonw, python -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -and (Get-CimInstance Win32_Process -Filter "ProcessId = $($_.Id)").CommandLine -like "*agent.py*" } |
-    Stop-Process -Force
+try {
+    Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction Stop |
+        Where-Object { $_.CommandLine -like "*agent.py*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }
+    Write-Host "  Stopped."
+} catch {
+    Write-Host "  No running agent process found."
+}
 
 Write-Host "Removing scheduled task '$taskName'..."
-Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+try {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
+    Write-Host "  Removed."
+} catch {
+    Write-Host "  Scheduled task not found, skipping."
+}
 
 Write-Host "Removing firewall rules..."
 netsh advfirewall firewall delete rule name="InternetEnabler-Block" | Out-Null
+Write-Host $(if ($LASTEXITCODE -eq 0) { "  Removed InternetEnabler-Block." } else { "  InternetEnabler-Block not found, skipping." })
 netsh advfirewall firewall delete rule name="InternetEnabler-Inbound" | Out-Null
+Write-Host $(if ($LASTEXITCODE -eq 0) { "  Removed InternetEnabler-Inbound." } else { "  InternetEnabler-Inbound not found, skipping." })
 
 Write-Host "Done. config.json, schedule.json, tasks.json and history.json were left in place -"
 Write-Host "delete the client folder yourself if you want to remove those too."

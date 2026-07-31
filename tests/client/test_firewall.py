@@ -34,22 +34,28 @@ def _fake_run(returncode, stdout, stderr=""):
     return run
 
 
+def _fake_run_ps(returncode, stdout, stderr=""):
+    def run(command):
+        return returncode, stdout, stderr
+    return run
+
+
 def test_rule_exists_true(monkeypatch):
-    monkeypatch.setattr(firewall, "_run", _fake_run(0, "Rule Name: X\nEnabled: Yes"))
+    monkeypatch.setattr(firewall, "_run_ps", _fake_run_ps(0, "True"))
     assert firewall._rule_exists("X") is True
 
 
 def test_rule_exists_false_when_no_match(monkeypatch):
-    monkeypatch.setattr(firewall, "_run", _fake_run(0, "No rules match the specified criteria."))
+    monkeypatch.setattr(firewall, "_run_ps", _fake_run_ps(0, "False"))
     assert firewall._rule_exists("X") is False
 
 
 def test_rule_exists_false_on_nonzero_exit(monkeypatch):
-    monkeypatch.setattr(firewall, "_run", _fake_run(1, "", "error"))
+    monkeypatch.setattr(firewall, "_run_ps", _fake_run_ps(1, "", "error"))
     assert firewall._rule_exists("X") is False
 
 
-def test_ensure_rules_skips_creation_when_rules_present(monkeypatch):
+def test_ensure_rules_reconciles_when_rules_present(monkeypatch):
     calls = []
     monkeypatch.setattr(firewall, "_rule_exists", lambda name: True)
 
@@ -59,7 +65,14 @@ def test_ensure_rules_skips_creation_when_rules_present(monkeypatch):
 
     monkeypatch.setattr(firewall, "_run", run)
     firewall.ensure_rules("192.168.1.0/24", 5987)
-    assert calls == []
+
+    assert len(calls) == 2
+    block_call, inbound_call = calls
+    assert "set" in block_call
+    assert f'name="{firewall.BLOCK_RULE_NAME}"' in block_call
+    assert "set" in inbound_call
+    assert f'name="{firewall.INBOUND_RULE_NAME}"' in inbound_call
+    assert "localport=5987" in inbound_call
 
 
 def test_ensure_rules_creates_missing_rules(monkeypatch):
@@ -108,15 +121,15 @@ def test_disable_block_failure(monkeypatch):
 
 
 def test_is_blocked_true(monkeypatch):
-    monkeypatch.setattr(firewall, "_run", _fake_run(0, "Rule Name: X\nEnabled: Yes\n"))
+    monkeypatch.setattr(firewall, "_run_ps", _fake_run_ps(0, "True"))
     assert firewall.is_blocked() is True
 
 
 def test_is_blocked_false_when_disabled(monkeypatch):
-    monkeypatch.setattr(firewall, "_run", _fake_run(0, "Rule Name: X\nEnabled: No\n"))
+    monkeypatch.setattr(firewall, "_run_ps", _fake_run_ps(0, "False"))
     assert firewall.is_blocked() is False
 
 
 def test_is_blocked_false_on_error(monkeypatch):
-    monkeypatch.setattr(firewall, "_run", _fake_run(1, "", "no such rule"))
+    monkeypatch.setattr(firewall, "_run_ps", _fake_run_ps(1, "", "no such rule"))
     assert firewall.is_blocked() is False
