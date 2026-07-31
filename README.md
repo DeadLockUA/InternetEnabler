@@ -50,6 +50,10 @@ create the firewall rules and the auto-start task:
 The script installs dependencies (`pystray`, `Pillow`) itself, sets up
 auto-start, and launches the agent right away.
 
+Alternatively, double-click `install.bat` — it re-launches itself
+elevated (UAC prompt) and then runs `install.ps1` for you, so no manual
+"Run as Administrator" step is needed.
+
 ### 2. Server (your computer)
 
 ```powershell
@@ -81,6 +85,31 @@ block itself — this works even if your computer is turned off.
 `get-tasks` shows the current list and which are done. `history` shows a
 log of every task confirmation (completed or skipped) over the given
 number of days, e.g. for a monthly review.
+
+## Uninstalling
+
+### Client (son's computer)
+
+Run `uninstall.ps1` **from PowerShell as Administrator** (or double-click
+`uninstall.bat`, which elevates itself automatically):
+
+```powershell
+cd client
+.\uninstall.ps1
+```
+
+This stops the running agent, removes the `InternetEnablerAgent`
+scheduled task, and deletes the `InternetEnabler-Block` /
+`InternetEnabler-Inbound` firewall rules. It leaves `config.json`,
+`schedule.json`, `tasks.json` and `history.json` in place — delete the
+`client` folder yourself if you want those gone too.
+
+### Server (your computer)
+
+The server has no installer — it's just a CLI script with a config
+file, nothing is registered with Windows. To remove it, delete the
+`server` folder (and uninstall any pip packages you installed for it,
+if desired).
 
 ## Important details
 
