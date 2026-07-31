@@ -3,3 +3,4 @@ client/schedule.json
 server/config.json
 __pycache__/
 *.pyc
+agents/
