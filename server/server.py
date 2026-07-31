@@ -1,0 +1,81 @@
+"""InternetEnabler server CLI.
+
+Controls the client agent running on the son's PC over the LAN.
+
+Usage:
+    python server.py status
+    python server.py block
+    python server.py unblock
+    python server.py set-schedule 20:30 21:00
+    python server.py set-schedule --clear
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+
+
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        sys.exit(f"config.json not found. Copy config.example.json to config.json and edit it first.")
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def request(config, method, path, body=None):
+    url = f"http://{config['client_host']}:{config['client_port']}{path}"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("X-Auth-Token", config["token"])
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        sys.exit(f"Client returned an error ({e.code}): {e.read().decode('utf-8', 'ignore')}")
+    except urllib.error.URLError as e:
+        sys.exit(f"Could not reach the client at {config['client_host']}:{config['client_port']} ({e.reason})")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Control the InternetEnabler client.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("status", help="Show whether internet is currently blocked")
+    sub.add_parser("block", help="Block internet now")
+    sub.add_parser("unblock", help="Unblock internet now")
+
+    sched = sub.add_parser("set-schedule", help="Set daily block times (HH:MM, 24h)")
+    sched.add_argument("times", nargs="*", help="e.g. 20:30 21:00")
+    sched.add_argument("--clear", action="store_true", help="Clear the schedule")
+
+    args = parser.parse_args()
+    config = load_config()
+
+    if args.command == "status":
+        result = request(config, "GET", "/status")
+        print("BLOCKED" if result["blocked"] else "OK (internet allowed)")
+    elif args.command == "block":
+        request(config, "POST", "/block")
+        print("Internet blocked.")
+    elif args.command == "unblock":
+        request(config, "POST", "/unblock")
+        print("Internet unblocked.")
+    elif args.command == "set-schedule":
+        times = [] if args.clear else args.times
+        for t in times:
+            if len(t) != 5 or t[2] != ":":
+                sys.exit(f"Invalid time format: {t!r}, expected HH:MM")
+        result = request(config, "POST", "/schedule", {"times": times})
+        print(f"Schedule set: {result['times']}")
+
+
+if __name__ == "__main__":
+    main()
