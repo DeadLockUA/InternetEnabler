@@ -19,6 +19,9 @@
 ## 3a. Proposals & Questions
 - Whenever asking/proposing something (options, approaches, decisions), give a quick evaluation: benefits vs drawbacks, so the user can decide fast.
 
+## 3b. Development Approach
+- Use test-driven development whenever possible: write/update the failing test first, then implement to make it pass.
+
 ## 4. Token Saving & Output Restrictions
 - No pleasantries (no "Sure", "Here is...", "Hope this helps").
 - Do not restate the user's request back before answering.
