@@ -25,9 +25,12 @@ CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 SCHEDULE_PATH = os.path.join(BASE_DIR, "schedule.json")
 TASKS_PATH = os.path.join(BASE_DIR, "tasks.json")
 HISTORY_PATH = os.path.join(BASE_DIR, "history.json")
+STATE_PATH = os.path.join(BASE_DIR, "state.json")
+LOG_PATH = os.path.join(BASE_DIR, "agent.log")
 
 DEFAULT_REMINDER_MINUTES = 15
 HISTORY_RETENTION_DAYS = 400
+MAX_BODY_BYTES = 64 * 1024
 
 
 def is_valid_time(value):
@@ -40,86 +43,131 @@ def is_valid_time(value):
         return False
 
 
-_lock = threading.Lock()
-_fired_today = {}  # {"HH:MM": date} -> last date this schedule entry fired the block
-_reminder_fired = set()  # {("HH:MM", date)} -> reminder already fired for this occurrence
+# Reentrant: persistence helpers below take this lock, and some callers
+# (e.g. on_enable) also hold it around a persistence call plus a firewall
+# call, so a plain Lock would deadlock on the nested acquisition.
+_lock = threading.RLock()
 _icon_ref = {"icon": None}
 
 
-def load_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+def log_error(context, exc=False):
+    """Append an error line (and traceback, if called from an except block) to
+    agent.log. The agent runs via pythonw with no console, so this is the only
+    place operators can see handler/thread failures."""
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now().isoformat(timespec='seconds')} ERROR {context}\n")
+        if exc:
+            f.write(traceback.format_exc())
+
+
+def _read_json(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
+def _write_json(path, data):
+    """Write via a temp file + atomic rename so a reader never observes a
+    partially-written (truncated) file."""
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+    os.replace(tmp_path, path)
+
+
+def load_config():
+    with _lock:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+
 def save_config(config):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=4)
+    with _lock:
+        _write_json(CONFIG_PATH, config)
 
 
 def load_schedule():
-    if not os.path.exists(SCHEDULE_PATH):
-        return []
-    with open(SCHEDULE_PATH, "r", encoding="utf-8") as f:
-        return json.load(f).get("times", [])
+    with _lock:
+        return _read_json(SCHEDULE_PATH, {"times": []}).get("times", [])
 
 
 def save_schedule(times):
-    with open(SCHEDULE_PATH, "w", encoding="utf-8") as f:
-        json.dump({"times": times}, f, indent=4)
+    with _lock:
+        _write_json(SCHEDULE_PATH, {"times": times})
 
 
 def load_tasks():
-    if not os.path.exists(TASKS_PATH):
-        return []
-    with open(TASKS_PATH, "r", encoding="utf-8") as f:
-        return json.load(f).get("tasks", [])
+    with _lock:
+        return _read_json(TASKS_PATH, {"tasks": []}).get("tasks", [])
 
 
 def save_tasks(tasks):
-    with open(TASKS_PATH, "w", encoding="utf-8") as f:
-        json.dump({"tasks": tasks}, f, indent=4)
+    with _lock:
+        _write_json(TASKS_PATH, {"tasks": tasks})
 
 
 def reset_tasks_done():
-    tasks = load_tasks()
-    if not tasks:
-        return
-    for t in tasks:
-        t["done"] = False
-    save_tasks(tasks)
+    with _lock:
+        tasks = _read_json(TASKS_PATH, {"tasks": []}).get("tasks", [])
+        if not tasks:
+            return
+        for t in tasks:
+            t["done"] = False
+        _write_json(TASKS_PATH, {"tasks": tasks})
 
 
 def mark_task_done(task_id):
-    """Reload tasks fresh and mark a single one done, under the caller's lock."""
-    tasks = load_tasks()
-    for t in tasks:
-        if t["id"] == task_id:
-            t["done"] = True
-    save_tasks(tasks)
+    """Reload tasks fresh and mark a single one done, atomically."""
+    with _lock:
+        tasks = _read_json(TASKS_PATH, {"tasks": []}).get("tasks", [])
+        for t in tasks:
+            if t["id"] == task_id:
+                t["done"] = True
+        _write_json(TASKS_PATH, {"tasks": tasks})
 
 
 def load_history():
-    if not os.path.exists(HISTORY_PATH):
-        return []
-    with open(HISTORY_PATH, "r", encoding="utf-8") as f:
-        return json.load(f).get("entries", [])
+    with _lock:
+        return _read_json(HISTORY_PATH, {"entries": []}).get("entries", [])
 
 
 def append_history(task_text, event):
-    entries = load_history()
-    entries.append({
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "task": task_text,
-        "event": event,  # "completed" or "skipped"
-    })
-    cutoff = datetime.now() - timedelta(days=HISTORY_RETENTION_DAYS)
-    entries = [e for e in entries if datetime.fromisoformat(e["timestamp"]) >= cutoff]
-    with open(HISTORY_PATH, "w", encoding="utf-8") as f:
-        json.dump({"entries": entries}, f, indent=4)
+    with _lock:
+        entries = _read_json(HISTORY_PATH, {"entries": []}).get("entries", [])
+        entries.append({
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "task": task_text,
+            "event": event,  # "completed" or "skipped"
+        })
+        cutoff = datetime.now() - timedelta(days=HISTORY_RETENTION_DAYS)
+        entries = [e for e in entries if datetime.fromisoformat(e["timestamp"]) >= cutoff]
+        _write_json(HISTORY_PATH, {"entries": entries})
+
+
+def load_state():
+    """Persisted scheduler state: which schedule entries/reminders already
+    fired today. Kept on disk (not just in memory) so an agent restart after
+    a block already fired today doesn't refire it and wipe task progress."""
+    with _lock:
+        data = _read_json(STATE_PATH, {})
+        return {
+            "date": data.get("date"),
+            "fired": data.get("fired", []),
+            "reminders_fired": data.get("reminders_fired", []),
+        }
+
+
+def save_state(state):
+    with _lock:
+        _write_json(STATE_PATH, state)
 
 
 def make_icon_image(blocked):
-    color = (200, 40, 40) if blocked else (40, 170, 70)
+    if blocked is None:
+        color = (230, 160, 20)  # amber: firewall state could not be determined
+    else:
+        color = (200, 40, 40) if blocked else (40, 170, 70)
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.ellipse((4, 4, 60, 60), fill=color)
@@ -185,6 +233,13 @@ class CommandHandler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length))
 
     def do_GET(self):
+        try:
+            self._do_GET()
+        except Exception:
+            log_error(f"GET {self.path} failed", exc=True)
+            self._send_json(500, {"error": "internal error"})
+
+    def _do_GET(self):
         if not self._authorized():
             self._send_json(401, {"error": "unauthorized"})
             return
@@ -214,8 +269,19 @@ class CommandHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        try:
+            self._do_POST()
+        except Exception:
+            log_error(f"POST {self.path} failed", exc=True)
+            self._send_json(500, {"error": "internal error"})
+
+    def _do_POST(self):
         if not self._authorized():
             self._send_json(401, {"error": "unauthorized"})
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        if length > MAX_BODY_BYTES:
+            self._send_json(413, {"error": "payload too large"})
             return
         if self.path == "/block":
             with _lock:
@@ -245,8 +311,7 @@ class CommandHandler(BaseHTTPRequestHandler):
                     {"id": i + 1, "text": text, "done": False}
                     for i, text in enumerate(texts)
                 ]
-                with _lock:
-                    save_tasks(tasks)
+                save_tasks(tasks)
                 self._send_json(200, {"tasks": tasks})
             except (ValueError, KeyError):
                 self._send_json(400, {"error": "invalid body"})
@@ -254,13 +319,18 @@ class CommandHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def log_message(self, format, *args):
-        pass  # keep console quiet
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} {self.address_string()} {format % args}\n")
 
 
 def run_http_server(config):
-    CommandHandler.config = config
-    server = ThreadingHTTPServer(("0.0.0.0", config["port"]), CommandHandler)
-    server.serve_forever()
+    try:
+        CommandHandler.config = config
+        server = ThreadingHTTPServer(("0.0.0.0", config["port"]), CommandHandler)
+        server.serve_forever()
+    except Exception:
+        log_error("run_http_server crashed", exc=True)
+        raise
 
 
 def scheduler_tick(now=None):
@@ -273,32 +343,55 @@ def scheduler_tick(now=None):
     config = load_config()
     reminder_minutes = config.get("reminder_minutes", DEFAULT_REMINDER_MINUTES)
 
+    state = load_state()
+    if state["date"] != today.isoformat():
+        state = {"date": today.isoformat(), "fired": [], "reminders_fired": []}
+        state_changed = True
+    else:
+        state_changed = False
+
     for entry in load_schedule():
         if not is_valid_time(entry):
             continue
         entry_today = datetime.combine(today, datetime.strptime(entry, "%H:%M").time())
 
-        # Check both today's and tomorrow's occurrence so a reminder window that
-        # crosses midnight (e.g. a 00:10 block reminded 15 minutes earlier) still fires.
-        for occurrence in (entry_today, entry_today + timedelta(days=1)):
-            reminder_dt = occurrence - timedelta(minutes=reminder_minutes)
-            fire_key = (entry, occurrence.date())
-            if reminder_dt.strftime("%H:%M") == current_time and fire_key not in _reminder_fired:
-                icon = _icon_ref["icon"]
-                if icon is not None:
-                    try:
-                        icon.notify(f"Internet will be blocked at {entry}.", "InternetEnabler")
-                    except Exception:
-                        pass
-                _reminder_fired.add(fire_key)
+        # The next occurrence of this entry from "now": today's if it hasn't
+        # passed yet, otherwise tomorrow's. Using a single occurrence (instead
+        # of checking both) avoids firing the reminder twice - today's and
+        # tomorrow's occurrence are exactly 24h apart and would otherwise
+        # produce the same HH:MM wall-clock reminder time.
+        next_occurrence = entry_today if entry_today >= now else entry_today + timedelta(days=1)
+        reminder_dt = next_occurrence - timedelta(minutes=reminder_minutes)
+        fire_key = f"{entry}|{next_occurrence.date().isoformat()}"
+
+        if (
+            reminder_dt.date() == today
+            and reminder_dt.strftime("%H:%M") == current_time
+            and fire_key not in state["reminders_fired"]
+        ):
+            icon = _icon_ref["icon"]
+            if icon is not None:
+                try:
+                    icon.notify(f"Internet will be blocked at {entry}.", "InternetEnabler")
+                except Exception:
+                    pass
+            state["reminders_fired"].append(fire_key)
+            state_changed = True
 
         # >= (not ==) so a block time missed while the PC was off/asleep still
-        # fires as soon as the agent is running again, instead of being skipped for the day.
-        if current_time >= entry and _fired_today.get(entry) != today:
+        # fires as soon as the agent is running again, instead of being skipped
+        # for the day. "fired" is persisted to state.json (not just kept in
+        # memory) so an agent restart after a block already fired today does
+        # not refire it and wipe the son's confirmed task progress.
+        if current_time >= entry and entry not in state["fired"]:
             with _lock:
                 firewall.enable_block()
                 reset_tasks_done()
-            _fired_today[entry] = today
+            state["fired"].append(entry)
+            state_changed = True
+
+    if state_changed:
+        save_state(state)
 
 
 def run_scheduler():
@@ -306,7 +399,7 @@ def run_scheduler():
         try:
             scheduler_tick()
         except Exception:
-            traceback.print_exc()
+            log_error("scheduler_tick failed", exc=True)
         time.sleep(20)
 
 
@@ -316,9 +409,9 @@ def on_enable(icon, item):
     Module-level (not a run_tray closure) so it's directly unit-testable.
     """
     with _lock:
-        already_unblocked = not firewall.is_blocked()
-    if already_unblocked:
-        return
+        blocked = firewall.is_blocked()
+    if blocked is False:
+        return  # only skip when we positively know it's already unblocked
 
     tasks = load_tasks()
     pending = [t for t in tasks if not t.get("done")]
@@ -328,11 +421,17 @@ def on_enable(icon, item):
             append_history(t["text"], "skipped")
             show_info("InternetEnabler", "Finish your tasks first.")
             return
-        with _lock:
-            mark_task_done(t["id"])
+        mark_task_done(t["id"])
         append_history(t["text"], "completed")
 
     with _lock:
+        # Re-verify nothing changed while the (potentially long-running)
+        # confirmation dialogs were up - a scheduled block firing mid-flow
+        # would reset_tasks_done() concurrently. If that happened, refuse to
+        # unblock rather than leaving the internet on with unconfirmed tasks.
+        if any(not t.get("done") for t in load_tasks()):
+            show_info("InternetEnabler", "Tasks changed while confirming - please try again.")
+            return
         firewall.disable_block()
     if icon is not None:
         icon.icon = make_icon_image(False)
@@ -361,6 +460,8 @@ def run_tray(config):
     def status_text(item):
         with _lock:
             blocked = firewall.is_blocked()
+        if blocked is None:
+            return "Internet: UNKNOWN"
         return "Internet: BLOCKED" if blocked else "Internet: OK"
 
     menu = pystray.Menu(

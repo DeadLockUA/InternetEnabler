@@ -7,6 +7,8 @@
 $ErrorActionPreference = "Stop"
 
 $taskName = "InternetEnablerAgent"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$agentPath = Join-Path $scriptDir "agent.py"
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "Please run this script from an elevated (Administrator) PowerShell window." -ForegroundColor Red
@@ -16,7 +18,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 Write-Host "Stopping the agent (if running)..."
 try {
     Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction Stop |
-        Where-Object { $_.CommandLine -like "*agent.py*" } |
+        Where-Object { $_.CommandLine -like "*$agentPath*" } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }
     Write-Host "  Stopped."
 } catch {
@@ -34,6 +36,8 @@ try {
 Write-Host "Removing firewall rules..."
 netsh advfirewall firewall delete rule name="InternetEnabler-Block" | Out-Null
 Write-Host $(if ($LASTEXITCODE -eq 0) { "  Removed InternetEnabler-Block." } else { "  InternetEnabler-Block not found, skipping." })
+netsh advfirewall firewall delete rule name="InternetEnabler-Block-IPv6" | Out-Null
+Write-Host $(if ($LASTEXITCODE -eq 0) { "  Removed InternetEnabler-Block-IPv6." } else { "  InternetEnabler-Block-IPv6 not found, skipping." })
 netsh advfirewall firewall delete rule name="InternetEnabler-Inbound" | Out-Null
 Write-Host $(if ($LASTEXITCODE -eq 0) { "  Removed InternetEnabler-Inbound." } else { "  InternetEnabler-Inbound not found, skipping." })
 

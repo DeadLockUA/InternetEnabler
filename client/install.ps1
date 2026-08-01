@@ -23,6 +23,18 @@ if (-not (Test-Path $configPath)) {
     notepad $configPath
 }
 
+$config = Get-Content $configPath -Raw | ConvertFrom-Json
+if ($config.token -eq "CHANGE_ME_SHARED_SECRET") {
+    Write-Error "config.json still has the default token (CHANGE_ME_SHARED_SECRET). Edit it and set a real shared secret before installing."
+    exit 1
+}
+try {
+    [void][ipaddress]::Parse(($config.lan_subnet -split '/')[0])
+} catch {
+    Write-Error "config.json has an invalid lan_subnet: '$($config.lan_subnet)' (expected CIDR, e.g. 192.168.1.0/24)."
+    exit 1
+}
+
 $pythonw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
 if (-not $pythonw) {
     $pythonw = (Get-Command python.exe -ErrorAction SilentlyContinue).Source
@@ -34,6 +46,10 @@ if (-not $pythonw) {
 
 Write-Host "Installing dependencies..."
 & python -m pip install -r (Join-Path $scriptDir "requirements.txt")
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "pip install failed (exit code $LASTEXITCODE). Fix the error above and re-run this script."
+    exit 1
+}
 
 # Use the interactively logged-on user, not $env:USERNAME - if this script was
 # elevated via a "Run as a different user" admin credential, $env:USERNAME would

@@ -33,6 +33,14 @@ def test_load_config_reads_json(config_file):
     assert config["client_port"] == 5987
 
 
+def test_load_config_missing_field_exits(tmp_path, monkeypatch):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"token": "secret", "client_host": "192.168.1.50"}))
+    monkeypatch.setattr(server, "CONFIG_PATH", str(path))
+    with pytest.raises(SystemExit):
+        server.load_config()
+
+
 # -- request() ----------------------------------------------------------
 
 class FakeResponse:
@@ -166,6 +174,11 @@ def test_cli_set_schedule_clear(monkeypatch, config_file):
     assert calls == [("POST", "/schedule", {"times": []})]
 
 
+def test_cli_set_schedule_clear_with_times_exits(monkeypatch, config_file):
+    with pytest.raises(SystemExit):
+        run_cli(monkeypatch, config_file, ["set-schedule", "--clear", "20:30"], {})
+
+
 def test_cli_set_tasks(monkeypatch, config_file, capsys):
     calls = run_cli(
         monkeypatch, config_file, ["set-tasks", "Homework", "Clean room"],
@@ -206,3 +219,26 @@ def test_cli_history_default_days(monkeypatch, config_file):
 def test_cli_history_custom_days(monkeypatch, config_file):
     calls = run_cli(monkeypatch, config_file, ["history", "--days", "7"], {("GET", "/history"): {"entries": []}})
     assert calls == [("GET", "/history?days=7", None)]
+
+
+def test_cli_history_zero_days_exits(monkeypatch, config_file):
+    with pytest.raises(SystemExit):
+        run_cli(monkeypatch, config_file, ["history", "--days", "0"], {})
+
+
+def test_cli_history_negative_days_exits(monkeypatch, config_file):
+    with pytest.raises(SystemExit):
+        run_cli(monkeypatch, config_file, ["history", "--days", "-5"], {})
+
+
+def test_cli_history_sanitizes_task_whitespace_in_output(monkeypatch, config_file, capsys):
+    # F15: a task containing tabs/newlines must not misalign the output into
+    # extra lines/columns.
+    run_cli(
+        monkeypatch, config_file, ["history"],
+        {("GET", "/history"): {"entries": [
+            {"timestamp": "2026-01-01T10:00:00", "event": "completed", "task": "Line1\tLine2\nLine3"},
+        ]}},
+    )
+    out = capsys.readouterr().out
+    assert len(out.rstrip("\n").split("\n")) == 1

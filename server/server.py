@@ -25,11 +25,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
 
+REQUIRED_CONFIG_FIELDS = ("client_host", "client_port", "token")
+
+
 def load_config():
     if not os.path.exists(CONFIG_PATH):
         sys.exit(f"config.json not found. Copy config.example.json to config.json and edit it first.")
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        config = json.load(f)
+    missing = [field for field in REQUIRED_CONFIG_FIELDS if field not in config]
+    if missing:
+        sys.exit(f"config.json is missing required field(s): {', '.join(missing)}")
+    return config
 
 
 def request(config, method, path, body=None):
@@ -69,6 +76,12 @@ def main():
     hist_parser.add_argument("--days", type=int, default=30, help="How many days back (default 30)")
 
     args = parser.parse_args()
+
+    if args.command == "set-schedule" and args.clear and args.times:
+        sys.exit("--clear cannot be combined with explicit times")
+    if args.command == "history" and args.days < 1:
+        sys.exit(f"--days must be at least 1, got {args.days}")
+
     config = load_config()
 
     if args.command == "status":
@@ -110,7 +123,8 @@ def main():
             print("No history.")
         else:
             for e in entries:
-                print(f"{e['timestamp']}  {e['event']:>9}  {e['task']}")
+                task = e["task"].replace("\t", " ").replace("\n", " ")
+                print(f"{e['timestamp']}  {e['event']:>9}  {task}")
 
 
 if __name__ == "__main__":

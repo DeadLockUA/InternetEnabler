@@ -123,3 +123,16 @@ if desired).
   tech-savvy teenager: administrator access on their own computer still
   allows removing the firewall rules or stopping the agent via Task
   Manager.
+- The token is sent as a plain `X-Auth-Token` HTTP header (no TLS), so
+  anyone sniffing the local network - or logged into the client's own
+  account - can read it. Acceptable given the trust model above, but
+  don't reuse this token anywhere that matters.
+- The client's HTTP server listens on `0.0.0.0` (every network adapter,
+  including VPNs), not just the LAN. The inbound firewall rule scopes
+  incoming connections to `lan_subnet`, but that rule only applies to
+  whichever Windows network profile is currently active - keep
+  `lan_subnet` accurate if the machine has multiple networks.
+- `lan_subnet` must be an IPv4 CIDR. The outbound block also includes a
+  separate rule that blocks all IPv6 traffic outright (there's no IPv6
+  LAN exclusion to configure), so IPv6-only devices on the LAN won't be
+  reachable from the client while blocked.

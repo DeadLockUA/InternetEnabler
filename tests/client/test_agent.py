@@ -15,8 +15,8 @@ def isolated_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "SCHEDULE_PATH", str(tmp_path / "schedule.json"))
     monkeypatch.setattr(agent, "TASKS_PATH", str(tmp_path / "tasks.json"))
     monkeypatch.setattr(agent, "HISTORY_PATH", str(tmp_path / "history.json"))
-    agent._fired_today.clear()
-    agent._reminder_fired.clear()
+    monkeypatch.setattr(agent, "STATE_PATH", str(tmp_path / "state.json"))
+    monkeypatch.setattr(agent, "LOG_PATH", str(tmp_path / "agent.log"))
     agent._icon_ref["icon"] = None
     yield
 
@@ -161,6 +161,46 @@ def test_on_enable_noop_when_already_unblocked(monkeypatch):
     assert called == []
 
 
+def test_on_enable_proceeds_when_block_state_unknown(monkeypatch):
+    # firewall.is_blocked() returning None means "couldn't determine state" (F7) -
+    # on_enable must not treat that as "already unblocked" and silently skip.
+    monkeypatch.setattr(agent.firewall, "is_blocked", lambda: None)
+    monkeypatch.setattr(agent, "ask_yes_no", lambda question: True)
+    agent.save_tasks([{"id": 1, "text": "Homework", "done": False}])
+    disabled = []
+    monkeypatch.setattr(agent.firewall, "disable_block", lambda: disabled.append(1))
+
+    agent.on_enable(None, None)
+
+    assert disabled == [1]
+
+
+def test_on_enable_aborts_if_tasks_reset_during_confirmation(monkeypatch):
+    # F4: a scheduled block firing mid-dialog resets all task "done" flags via
+    # reset_tasks_done(). on_enable must notice this at the end and refuse to
+    # unblock, instead of blindly disabling the block it just raced with.
+    agent.save_tasks([
+        {"id": 1, "text": "Already done earlier today", "done": True},
+        {"id": 2, "text": "Homework", "done": False},
+    ])
+    monkeypatch.setattr(agent.firewall, "is_blocked", lambda: True)
+    disabled = []
+    monkeypatch.setattr(agent.firewall, "disable_block", lambda: disabled.append(1))
+
+    def fake_ask(question):
+        agent.reset_tasks_done()  # simulates a concurrent scheduler_tick firing
+        return True
+
+    monkeypatch.setattr(agent, "ask_yes_no", fake_ask)
+    shown = []
+    monkeypatch.setattr(agent, "show_info", lambda title, message: shown.append(message))
+
+    agent.on_enable(None, None)
+
+    assert disabled == []
+    assert shown
+
+
 # -- scheduler_tick ---------------------------------------------------------
 
 def test_scheduler_tick_ignores_invalid_schedule_entries():
@@ -199,7 +239,68 @@ def test_scheduler_tick_reminder_crosses_midnight(monkeypatch):
 
     agent.scheduler_tick(datetime(2026, 1, 1, 23, 55))  # evening before the 00:10 block
 
-    assert any("00:10" in m for m in fake_icon.notified)
+    # F2: exactly one notification, not two (was firing for both today's and
+    # tomorrow's occurrence since they share the same HH:MM wall-clock string).
+    matching = [m for m in fake_icon.notified if "00:10" in m]
+    assert len(matching) == 1
+
+
+def test_scheduler_tick_reminder_fires_exactly_once_normal_case(monkeypatch):
+    agent.save_schedule(["08:00"])
+    agent.save_config({"token": "t", "port": 5987, "reminder_minutes": 15})
+    monkeypatch.setattr(agent.firewall, "enable_block", lambda: None)
+
+    class FakeIcon:
+        def __init__(self):
+            self.notified = []
+
+        def notify(self, message, title):
+            self.notified.append(message)
+
+    fake_icon = FakeIcon()
+    agent._icon_ref["icon"] = fake_icon
+
+    agent.scheduler_tick(datetime(2026, 1, 1, 7, 45))  # 15 min before 08:00
+
+    assert len(fake_icon.notified) == 1
+
+
+def test_scheduler_tick_state_survives_simulated_restart(monkeypatch):
+    # F1: a restarted process has no in-memory history, only whatever was
+    # persisted. Reload state fresh from disk (simulating "process restarted")
+    # and make sure the block does not refire / wipe task progress again.
+    agent.save_schedule(["08:00"])
+    agent.save_config({"token": "t", "port": 5987})
+    agent.save_tasks([{"id": 1, "text": "Homework", "done": False}])
+    enabled = []
+    monkeypatch.setattr(agent.firewall, "enable_block", lambda: enabled.append(1))
+
+    agent.scheduler_tick(datetime(2026, 1, 1, 8, 5))
+    assert enabled == [1]
+
+    state = agent.load_state()
+    assert "08:00" in state["fired"]
+
+    agent.mark_task_done(1)  # son confirmed his task after the block fired
+
+    # "restart": nothing in memory carries over, scheduler_tick only ever
+    # reads/writes state.json, so this reproduces a fresh process.
+    agent.scheduler_tick(datetime(2026, 1, 1, 9, 0))
+
+    assert enabled == [1]  # must not refire
+    assert agent.load_tasks()[0]["done"] is True  # must not wipe progress
+
+
+def test_scheduler_tick_state_resets_on_new_day(monkeypatch):
+    agent.save_schedule(["08:00"])
+    agent.save_config({"token": "t", "port": 5987})
+    enabled = []
+    monkeypatch.setattr(agent.firewall, "enable_block", lambda: enabled.append(1))
+
+    agent.scheduler_tick(datetime(2026, 1, 1, 8, 5))
+    agent.scheduler_tick(datetime(2026, 1, 2, 8, 5))
+
+    assert enabled == [1, 1]
 
 
 def test_run_scheduler_survives_exception_from_tick(monkeypatch):
@@ -258,6 +359,32 @@ def server(monkeypatch):
     srv = LiveServer({"token": "secret", "port": 0})
     yield srv
     srv.stop()
+
+
+def test_status_returns_null_when_block_state_unknown(server, monkeypatch):
+    monkeypatch.setattr(agent.firewall, "is_blocked", lambda: None)
+    status, payload = server.request("GET", "/status")
+    assert status == 200
+    assert payload == {"blocked": None}
+
+
+def test_post_rejects_oversized_body(server):
+    status, payload = server.request(
+        "POST", "/tasks", body={"tasks": ["x" * (agent.MAX_BODY_BYTES + 1)]}
+    )
+    assert status == 413
+
+
+def test_get_history_returns_500_and_logs_on_corrupt_file(server):
+    with open(agent.HISTORY_PATH, "w", encoding="utf-8") as f:
+        f.write("{not valid json")
+
+    status, payload = server.request("GET", "/history")
+
+    assert status == 500
+    with open(agent.LOG_PATH, "r", encoding="utf-8") as f:
+        log_contents = f.read()
+    assert "history" in log_contents.lower() or "GET" in log_contents
 
 
 def test_status_requires_auth(server):
