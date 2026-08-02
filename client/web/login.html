@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>InternetEnabler - Login</title>
+<style>
+body { font-family: system-ui, sans-serif; background: #1e1e2e; color: #cdd6f4; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+.card { background: #313244; padding: 2rem; border-radius: 12px; width: 320px; box-shadow: 0 4px 20px rgba(0,0,0,.4); }
+h1 { margin: 0 0 1.5rem; font-size: 1.3rem; text-align: center; }
+label { display: block; margin-bottom: .4rem; font-size: .9rem; }
+input[type=password] { width: 100%; box-sizing: border-box; padding: .6rem; border-radius: 8px; border: 1px solid #45475a; background: #11111b; color: #cdd6f4; margin-bottom: 1rem; }
+button { width: 100%; padding: .6rem; border: 0; border-radius: 8px; background: #89b4fa; color: #11111b; font-weight: 600; cursor: pointer; }
+button:hover { background: #b4befe; }
+.error { color: #f38ba8; margin-top: 1rem; font-size: .9rem; text-align: center; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>InternetEnabler</h1>
+  <form id="login-form">
+    <label for="password">Family password</label>
+    <input type="password" id="password" autocomplete="current-password" required autofocus>
+    <button type="submit">Log in</button>
+  </form>
+  <div class="error" id="error"></div>
+</div>
+<script>
+document.getElementById("login-form").addEventListener("submit", async function (e) {
+  e.preventDefault();
+  const pwd = document.getElementById("password").value;
+  const err = document.getElementById("error");
+  err.textContent = "";
+  try {
+    const resp = await fetch("/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: pwd })
+    });
+    const data = await resp.json();
+    if (resp.ok && data.ok) {
+      window.location.href = "/panel";
+    } else {
+      err.textContent = data.error || "Login failed.";
+    }
+  } catch (ex) {
+    err.textContent = "Cannot reach the agent.";
+  }
+});
+</script>
+</body>
+</html>

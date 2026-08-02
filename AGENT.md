@@ -2,8 +2,10 @@
 
 ## 0. Project Context
 - InternetEnabler: family tool to schedule/toggle a son's internet access via Windows Firewall rules.
-- Two components, LAN-only, server → client HTTP commands secured by a shared token: `client` (runs on son's PC, tray icon, firewall control) and `server` (CLI on parent's PC).
+- Single component: `client` runs on the son's PC (tray icon, firewall control, scheduler, HTTP server). The HTTP server serves a password-protected web panel (login + tabs for status/schedule/tasks/history/messages) usable from any browser on the LAN. The raw X-Auth-Token API remains for automation.
 - Trust-based, not security-hardened: local admin on the client can always bypass it. Don't over-engineer security here.
+- The web panel is deliberately block-only: unblocking stays on the son's tray icon (after task confirmation).
+- Messages sent from the panel persist (messages.json) and notify the tray icon; inbox is available in the tray menu.
 
 ## 1. Core Persona & Rules
 - Language: English only.
