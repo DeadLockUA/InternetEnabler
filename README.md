@@ -63,6 +63,59 @@ elevated (UAC prompt) and then runs `install.ps1` for you, so no manual
 It's best to fix the son's computer IP via a DHCP reservation on the
 router so the web panel address doesn't change.
 
+## Configuring `config.json`
+
+`config.json` sits next to the agent scripts in the `client` folder. It
+is a plain JSON file with the following settings:
+
+| Field              | Example                  | Purpose                                                                  |
+| ------------------ | ------------------------ | ------------------------------------------------------------------------ |
+| `token`            | `CHANGE_ME_SHARED_SECRET`| Shared secret for API calls (`X-Auth-Token` header)                      |
+| `web_password`     | `CHANGE_ME_FAMILY_PASSWORD` | Password for the web panel (`http://<son-pc-ip>:<port>`) login        |
+| `port`             | `5987`                   | TCP port the web panel and API server listen on                          |
+| `lan_subnet`       | `192.168.1.0/24`         | IPv4 CIDR of your local network                                          |
+| `reminder_minutes` | `15`                     | Minutes before a scheduled block that the tray shows a warning           |
+
+All fields are required. The file must be valid JSON — double-check quotes
+and commas if the agent fails to start after editing.
+
+**`token`** — any long random string (for example
+`openssl rand -hex 32` on your own machine). It is sent in the
+`X-Auth-Token` HTTP header in every API request from the web panel and
+from any script that talks to the agent over the LAN. Anyone who knows it
+can view and change the schedule and tasks.
+
+**`web_password`** — the family password shown on the login page of the
+web panel. If it is empty or missing, logins are rejected with
+"web_password not configured on the client".
+
+**`port`** — the TCP port of the agent's HTTP server. The web panel is
+then reachable at `http://<son-pc-ip>:<port>`. If you change it after the
+first install, restart the agent — the inbound firewall rule is reconciled
+against the new port automatically.
+
+**`lan_subnet`** — the IPv4 CIDR block of your local network, usually the
+subnet of your router (e.g. `192.168.1.0/24`). It is used for two things:
+
+- The outbound block rule allows traffic *to this subnet* even when
+  internet is blocked, so the web panel keeps working from phones,
+  tablets and laptops in the house.
+- The inbound firewall rule only lets devices in this subnet reach the
+  web panel at all.
+
+If it is wrong, either the web panel becomes unreachable while internet
+is blocked, or LAN devices are blocked from the panel. It must be IPv4 —
+IPv6 is blocked outright while the block is active. Changing it after the
+first install only takes effect after the agent restarts.
+
+**`reminder_minutes`** — how many minutes before a scheduled block the
+tray icon shows a warning notification (`0` disables the warning). This
+can also be changed any time from the tray menu via **Set Reminder
+Time...**.
+
+After editing `config.json`, restart the agent (or just re-run
+`install.ps1`) for the changes to take effect.
+
 ## Usage
 
 Open `http://<son-pc-ip>:5987` from any browser on the LAN and log in
