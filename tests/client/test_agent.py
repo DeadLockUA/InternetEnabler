@@ -15,6 +15,7 @@ def isolated_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "SCHEDULE_PATH", str(tmp_path / "schedule.json"))
     monkeypatch.setattr(agent, "TASKS_PATH", str(tmp_path / "tasks.json"))
     monkeypatch.setattr(agent, "HISTORY_PATH", str(tmp_path / "history.json"))
+    monkeypatch.setattr(agent, "MESSAGES_PATH", str(tmp_path / "messages.json"))
     monkeypatch.setattr(agent, "STATE_PATH", str(tmp_path / "state.json"))
     monkeypatch.setattr(agent, "LOG_PATH", str(tmp_path / "agent.log"))
     agent._icon_ref["icon"] = None
@@ -97,6 +98,37 @@ def test_append_history_prunes_entries_older_than_retention():
 
     entries = agent.load_history()
     assert [e["task"] for e in entries] == ["New"]
+
+
+# -- messages -------------------------------------------------------------
+
+def test_load_messages_missing_file_returns_empty_list():
+    assert agent.load_messages() == []
+
+
+def test_append_message_inserts_newest_first_and_notifies(monkeypatch):
+    notified = []
+    monkeypatch.setattr(agent, "_icon_ref", {"icon": type("Fake", (), {"notify": lambda self, m, t: notified.append(m)})()})
+    agent.append_message("Dinner ready")
+    agent.append_message("Clean up")
+    messages = agent.load_messages()
+    assert [m["text"] for m in messages] == ["Clean up", "Dinner ready"]
+    assert "timestamp" in messages[0]
+    assert len(notified) == 2
+
+
+def test_append_message_caps_at_max_messages():
+    for i in range(agent.MAX_MESSAGES + 10):
+        agent.append_message(f"msg {i}")
+    messages = agent.load_messages()
+    assert len(messages) == agent.MAX_MESSAGES
+    assert messages[0]["text"] == f"msg {agent.MAX_MESSAGES + 9}"
+
+
+def test_append_message_noop_notify_when_no_icon():
+    agent._icon_ref["icon"] = None
+    agent.append_message("hello")  # should not raise
+    assert agent.load_messages()[0]["text"] == "hello"
 
 
 # -- is_valid_time ------------------------------------------------------
@@ -326,6 +358,7 @@ def test_run_scheduler_survives_exception_from_tick(monkeypatch):
 class LiveServer:
     def __init__(self, config):
         agent.CommandHandler.config = config
+        self.config = config
         self.httpd = agent.ThreadingHTTPServer(("127.0.0.1", 0), agent.CommandHandler)
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -481,3 +514,170 @@ def test_history_default_days(server):
     status, payload = server.request("GET", "/history")
     assert status == 200
     assert payload == {"entries": []}
+
+
+# -- web panel (login / sessions / api) ----------------------------------
+
+def test_login_sets_session_cookie(server):
+    server.config["web_password"] = "family"
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    body = json.dumps({"password": "family"}).encode("utf-8")
+    conn.request("POST", "/login", body=body, headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    payload = json.loads(resp.read().decode("utf-8"))
+    cookies = resp.getheader("Set-Cookie", "")
+    conn.close()
+    assert resp.status == 200
+    assert payload == {"ok": True}
+    assert "ie_session=" in cookies
+
+
+def test_login_wrong_password_rejected(server):
+    server.config["web_password"] = "family"
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    body = json.dumps({"password": "wrong"}).encode("utf-8")
+    conn.request("POST", "/login", body=body, headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    payload = json.loads(resp.read().decode("utf-8"))
+    conn.close()
+    assert resp.status == 401
+    assert payload["ok"] is False
+
+
+def test_login_not_configured(server):
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    body = json.dumps({"password": "x"}).encode("utf-8")
+    conn.request("POST", "/login", body=body, headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    payload = json.loads(resp.read().decode("utf-8"))
+    conn.close()
+    assert resp.status == 401
+    assert "not configured" in payload["error"].lower()
+
+
+def test_root_serves_login_page(server):
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    conn.request("GET", "/")
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8")
+    conn.close()
+    assert resp.status == 200
+    assert "<html" in body.lower()
+    assert "password" in body.lower()
+
+
+def test_panel_requires_session(server):
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    conn.request("GET", "/panel")
+    resp = conn.getresponse()
+    conn.close()
+    assert resp.status == 302
+    assert resp.getheader("Location") == "/"
+
+
+def test_panel_served_with_valid_session(server):
+    server.config["web_password"] = "family"
+    connto = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    body = json.dumps({"password": "family"}).encode("utf-8")
+    connto.request("POST", "/login", body=body, headers={"Content-Type": "application/json"})
+    resp = connto.getresponse()
+    cookie = resp.getheader("Set-Cookie", "").split(";")[0]
+    resp.read()
+    connto.close()
+
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    conn.request("GET", "/panel", headers={"Cookie": cookie})
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8")
+    conn.close()
+    assert resp.status == 200
+    assert "<html" in body.lower()
+
+
+def test_api_requires_auth_without_session(server):
+    status, payload = server.request("GET", "/api/status", token=None)
+    assert status == 401
+
+
+def test_api_works_with_session(server):
+    server.config["web_password"] = "family"
+    connto = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    body = json.dumps({"password": "family"}).encode("utf-8")
+    connto.request("POST", "/login", body=body, headers={"Content-Type": "application/json"})
+    resp = connto.getresponse()
+    cookie = resp.getheader("Set-Cookie", "").split(";")[0]
+    resp.read()
+    connto.close()
+
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    conn.request("GET", "/api/status", headers={"Cookie": cookie})
+    resp = conn.getresponse()
+    payload = json.loads(resp.read().decode("utf-8"))
+    conn.close()
+    assert resp.status == 200
+    assert payload == {"blocked": False}
+
+
+def test_api_block_with_session_resets_tasks(server, monkeypatch):
+    server.config["web_password"] = "family"
+    connto = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    body = json.dumps({"password": "family"}).encode("utf-8")
+    connto.request("POST", "/login", body=body, headers={"Content-Type": "application/json"})
+    resp = connto.getresponse()
+    cookie = resp.getheader("Set-Cookie", "").split(";")[0]
+    resp.read()
+    connto.close()
+    calls = []
+    monkeypatch.setattr(agent, "reset_tasks_done", lambda: calls.append(1))
+
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    conn.request("POST", "/api/block", headers={"Cookie": cookie})
+    resp = conn.getresponse()
+    payload = json.loads(resp.read().decode("utf-8"))
+    conn.close()
+    assert resp.status == 200
+    assert payload == {"blocked": True}
+    assert calls == [1]
+
+
+def test_messages_round_trip(server):
+    status, payload = server.request("POST", "/api/messages", body={"text": "Dinner ready"})
+    assert status == 200
+    assert len(payload["messages"]) == 1
+    assert payload["messages"][0]["text"] == "Dinner ready"
+
+    status, payload = server.request("GET", "/api/messages")
+    assert status == 200
+    assert payload["messages"][0]["text"] == "Dinner ready"
+
+
+def test_messages_reject_empty_or_too_long(server):
+    status, payload = server.request("POST", "/api/messages", body={"text": "   "})
+    assert status == 400
+    status, payload = server.request(
+        "POST", "/api/messages", body={"text": "x" * (agent.MAX_MESSAGE_CHARS + 1)}
+    )
+    assert status == 400
+
+
+def test_logout_invalidates_session(server):
+    server.config["web_password"] = "family"
+    connto = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    body = json.dumps({"password": "family"}).encode("utf-8")
+    connto.request("POST", "/login", body=body, headers={"Content-Type": "application/json"})
+    resp = connto.getresponse()
+    cookie = resp.getheader("Set-Cookie", "").split(";")[0]
+    resp.read()
+    connto.close()
+
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    conn.request("POST", "/logout", headers={"Cookie": cookie})
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    conn.request("GET", "/api/status", headers={"Cookie": cookie})
+    resp = conn.getresponse()
+    conn.close()
+    assert resp.status == 401

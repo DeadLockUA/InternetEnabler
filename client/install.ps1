@@ -18,7 +18,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 }
 
 if (-not (Test-Path $configPath)) {
-    Write-Host "config.json not found, copying from config.example.json - EDIT IT before continuing (token, lan_subnet)."
+    Write-Host "config.json not found, copying from config.example.json - EDIT IT before continuing (token, web_password, lan_subnet)."
     Copy-Item (Join-Path $scriptDir "config.example.json") $configPath
     notepad $configPath
 }
@@ -26,6 +26,10 @@ if (-not (Test-Path $configPath)) {
 $config = Get-Content $configPath -Raw | ConvertFrom-Json
 if ($config.token -eq "CHANGE_ME_SHARED_SECRET") {
     Write-Error "config.json still has the default token (CHANGE_ME_SHARED_SECRET). Edit it and set a real shared secret before installing."
+    exit 1
+}
+if ($config.web_password -eq "CHANGE_ME_FAMILY_PASSWORD") {
+    Write-Error "config.json still has the default web_password (CHANGE_ME_FAMILY_PASSWORD). Set a real password for the web panel before installing."
     exit 1
 }
 try {
@@ -71,4 +75,4 @@ Write-Host "Scheduled task '$taskName' created for user '$loggedOnUser'. Startin
 Start-ScheduledTask -TaskName $taskName
 
 Write-Host "Done. The agent will start automatically at every logon (admin rights, no UAC prompt)."
-Write-Host "Edit schedule.json (or use the server) to set daily block times."
+Write-Host "Open http://<this-computer-ip>:$($config.port) from any device on the LAN to manage schedule, tasks and messages."

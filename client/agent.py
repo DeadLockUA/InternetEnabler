@@ -19,18 +19,22 @@ from PIL import Image, ImageDraw
 import pystray
 
 import firewall
+import web_ui
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 SCHEDULE_PATH = os.path.join(BASE_DIR, "schedule.json")
 TASKS_PATH = os.path.join(BASE_DIR, "tasks.json")
 HISTORY_PATH = os.path.join(BASE_DIR, "history.json")
+MESSAGES_PATH = os.path.join(BASE_DIR, "messages.json")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
 LOG_PATH = os.path.join(BASE_DIR, "agent.log")
 
 DEFAULT_REMINDER_MINUTES = 15
 HISTORY_RETENTION_DAYS = 400
 MAX_BODY_BYTES = 64 * 1024
+MAX_MESSAGES = 100
+MAX_MESSAGE_CHARS = 2000
 
 
 def is_valid_time(value):
@@ -145,6 +149,30 @@ def append_history(task_text, event):
         _write_json(HISTORY_PATH, {"entries": entries})
 
 
+def load_messages():
+    """Message inbox, newest first. Each entry: {"timestamp": iso, "text": str}."""
+    with _lock:
+        return _read_json(MESSAGES_PATH, {"messages": []}).get("messages", [])
+
+
+def append_message(text):
+    """Persist a message (newest first, capped at MAX_MESSAGES) and notify the
+    tray icon if one is running. Returns the new entry."""
+    entry = {"timestamp": datetime.now().isoformat(timespec="seconds"), "text": text}
+    with _lock:
+        messages = _read_json(MESSAGES_PATH, {"messages": []}).get("messages", [])
+        messages.insert(0, entry)
+        del messages[MAX_MESSAGES:]
+        _write_json(MESSAGES_PATH, {"messages": messages})
+    icon = _icon_ref["icon"]
+    if icon is not None:
+        try:
+            icon.notify(f"Message: {text}", "InternetEnabler")
+        except Exception:
+            pass
+    return entry
+
+
 def load_state():
     """Persisted scheduler state: which schedule entries/reminders already
     fired today. Kept on disk (not just in memory) so an agent restart after
@@ -232,6 +260,73 @@ class CommandHandler(BaseHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(length))
 
+    def _send_html(self, code, html):
+        body = html.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_redirect(self, location):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.end_headers()
+
+    def _client_ip(self):
+        return self.client_address[0]
+
+    def _auth_session(self):
+        """Return the session id from the Cookie header if it is valid, else None."""
+        cookie = self.headers.get("Cookie", "")
+        sid = None
+        for part in cookie.split(";"):
+            part = part.strip()
+            if part.startswith(web_ui.SESSION_COOKIE + "="):
+                sid = part[len(web_ui.SESSION_COOKIE) + 1:]
+                break
+        return sid if web_ui.is_valid_session(sid) else None
+
+    def _authed(self):
+        """True iff the request has a valid token header OR a valid web session."""
+        return self._authorized() or self._auth_session() is not None
+
+    def _do_login(self):
+        try:
+            body = self._read_json_body()
+            password = body.get("password", "")
+        except (ValueError, KeyError):
+            self._send_json(400, {"error": "invalid body"})
+            return
+        result = web_ui.check_login(self._client_ip(), password, self.config)
+        if result["ok"]:
+            sid = web_ui.create_session()
+            self.send_response(200)
+            self.send_header(
+                "Set-Cookie",
+                f"{web_ui.SESSION_COOKIE}={sid}; HttpOnly; SameSite=Strict; Path=/",
+            )
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b'{"ok": true}')))
+            self.end_headers()
+            self.wfile.write(b'{"ok": true}')
+        else:
+            self._send_json(401, result)
+
+    def _do_logout(self):
+        sid = self._auth_session()
+        if sid is not None:
+            web_ui.delete_session(sid)
+        self.send_response(200)
+        self.send_header(
+            "Set-Cookie",
+            f"{web_ui.SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+        )
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
     def do_GET(self):
         try:
             self._do_GET()
@@ -240,20 +335,35 @@ class CommandHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "internal error"})
 
     def _do_GET(self):
-        if not self._authorized():
-            self._send_json(401, {"error": "unauthorized"})
-            return
         parsed = urlparse(self.path)
         path = parsed.path
-        if path == "/status":
+
+        if path == "/":
+            self._send_html(200, web_ui.load_login_html())
+            return
+        if path == "/panel":
+            if self._auth_session() is None:
+                self._send_redirect("/")
+                return
+            self._send_html(200, web_ui.load_panel_html())
+            return
+        if path.startswith("/api/"):
+            if not self._authed():
+                self._send_json(401, {"error": "unauthorized"})
+                return
+        elif not self._authorized():
+            self._send_json(401, {"error": "unauthorized"})
+            return
+
+        if path in ("/status", "/api/status"):
             with _lock:
                 blocked = firewall.is_blocked()
             self._send_json(200, {"blocked": blocked})
-        elif path == "/schedule":
+        elif path in ("/schedule", "/api/schedule"):
             self._send_json(200, {"times": load_schedule()})
-        elif path == "/tasks":
+        elif path in ("/tasks", "/api/tasks"):
             self._send_json(200, {"tasks": load_tasks()})
-        elif path == "/history":
+        elif path in ("/history", "/api/history"):
             qs = parse_qs(parsed.query)
             try:
                 days = int(qs.get("days", ["30"])[0])
@@ -265,6 +375,8 @@ class CommandHandler(BaseHTTPRequestHandler):
                 if datetime.fromisoformat(e["timestamp"]) >= cutoff
             ]
             self._send_json(200, {"entries": entries})
+        elif path == "/api/messages":
+            self._send_json(200, {"messages": load_messages()})
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -276,14 +388,24 @@ class CommandHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "internal error"})
 
     def _do_POST(self):
-        if not self._authorized():
-            self._send_json(401, {"error": "unauthorized"})
-            return
         length = int(self.headers.get("Content-Length", 0))
         if length > MAX_BODY_BYTES:
             self._send_json(413, {"error": "payload too large"})
             return
-        if self.path == "/block":
+        if self.path == "/login":
+            self._do_login()
+            return
+        if self.path == "/logout":
+            self._do_logout()
+            return
+        if self.path.startswith("/api/"):
+            if not self._authed():
+                self._send_json(401, {"error": "unauthorized"})
+                return
+        elif not self._authorized():
+            self._send_json(401, {"error": "unauthorized"})
+            return
+        if self.path in ("/block", "/api/block"):
             with _lock:
                 firewall.enable_block()
                 reset_tasks_done()
@@ -292,7 +414,7 @@ class CommandHandler(BaseHTTPRequestHandler):
             with _lock:
                 firewall.disable_block()
             self._send_json(200, {"blocked": False})
-        elif self.path == "/schedule":
+        elif self.path in ("/schedule", "/api/schedule"):
             try:
                 body = self._read_json_body()
                 times = body.get("times", [])
@@ -303,7 +425,7 @@ class CommandHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"times": times})
             except (ValueError, KeyError):
                 self._send_json(400, {"error": "invalid body"})
-        elif self.path == "/tasks":
+        elif self.path in ("/tasks", "/api/tasks"):
             try:
                 body = self._read_json_body()
                 texts = body.get("tasks", [])
@@ -313,6 +435,20 @@ class CommandHandler(BaseHTTPRequestHandler):
                 ]
                 save_tasks(tasks)
                 self._send_json(200, {"tasks": tasks})
+            except (ValueError, KeyError):
+                self._send_json(400, {"error": "invalid body"})
+        elif self.path == "/api/messages":
+            try:
+                body = self._read_json_body()
+                text = str(body.get("text", "")).strip()
+                if not text:
+                    self._send_json(400, {"error": "message is empty"})
+                    return
+                if len(text) > MAX_MESSAGE_CHARS:
+                    self._send_json(400, {"error": f"message too long (max {MAX_MESSAGE_CHARS} chars)"})
+                    return
+                append_message(text)
+                self._send_json(200, {"messages": load_messages()})
             except (ValueError, KeyError):
                 self._send_json(400, {"error": "invalid body"})
         else:
@@ -446,6 +582,15 @@ def on_view_tasks(icon, item):
     show_info("Your Tasks", "\n".join(lines))
 
 
+def on_view_messages(icon, item):
+    messages = load_messages()
+    if not messages:
+        show_info("Messages", "No messages.")
+        return
+    lines = [f"{m['timestamp']}: {m['text']}" for m in messages[:20]]
+    show_info("Messages", "\n".join(lines))
+
+
 def on_set_reminder(icon, item):
     config = load_config()
     current = config.get("reminder_minutes", DEFAULT_REMINDER_MINUTES)
@@ -468,6 +613,7 @@ def run_tray(config):
         pystray.MenuItem(status_text, None, enabled=False),
         pystray.MenuItem("Enable Internet", on_enable, default=True),
         pystray.MenuItem("View Tasks", on_view_tasks),
+        pystray.MenuItem("View Messages", on_view_messages),
         pystray.MenuItem("Set Reminder Time...", on_set_reminder),
     )
 

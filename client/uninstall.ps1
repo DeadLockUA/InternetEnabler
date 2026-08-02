@@ -41,5 +41,5 @@ Write-Host $(if ($LASTEXITCODE -eq 0) { "  Removed InternetEnabler-Block-IPv6." 
 netsh advfirewall firewall delete rule name="InternetEnabler-Inbound" | Out-Null
 Write-Host $(if ($LASTEXITCODE -eq 0) { "  Removed InternetEnabler-Inbound." } else { "  InternetEnabler-Inbound not found, skipping." })
 
-Write-Host "Done. config.json, schedule.json, tasks.json and history.json were left in place -"
+Write-Host "Done. config.json, schedule.json, tasks.json, history.json, messages.json and state.json were left in place -"
 Write-Host "delete the client folder yourself if you want to remove those too."
