@@ -116,6 +116,49 @@ Time...**.
 After editing `config.json`, restart the agent (or just re-run
 `install.ps1`) for the changes to take effect.
 
+## Checking that the agent is running
+
+The agent runs without a console window (it uses `pythonw.exe`), so
+"nothing happened" doesn't mean it's not running. Check any of these:
+
+- **Tray icon** — a colored circle in the system tray (notification
+  area) near the clock: red = internet blocked, green = internet OK,
+  amber = state unknown. The tray may be hidden behind the "show hidden
+  icons" arrow.
+- **Web panel** — from any device on the LAN, open
+  `http://<son-pc-ip>:<port>` in a browser. If the login page loads, the
+  agent is up.
+- **Scheduled task** — in an (elevated) PowerShell on the son's PC:
+
+  ```powershell
+  Get-ScheduledTask -TaskName InternetEnablerAgent
+  Get-ScheduledTaskInfo -TaskName InternetEnablerAgent
+  ```
+
+  The first shows overall state (`Ready`/`Running`), the second shows the
+  last run result (`The operation completed successfully` when OK) and
+  next run time (after the next logon).
+- **Port reachability** — from any device on the LAN:
+
+  ```powershell
+  Test-NetConnection <son-pc-ip> -Port <port>
+  ```
+
+  `TcpTestSucceeded : True` means the panel is listening.
+- **Process** — in Task Manager (Details tab), look for a `pythonw.exe`
+  process running the agent.
+- **Log file** — the agent writes errors to `client\agent.log`. If the
+  agent crashes at startup, the reason is usually there.
+
+To restart the agent after a config change, either re-run `install.ps1`
+(as Administrator) or, in an elevated PowerShell, stop and start the
+scheduled task:
+
+```powershell
+Stop-ScheduledTask -TaskName InternetEnablerAgent
+Start-ScheduledTask -TaskName InternetEnablerAgent
+```
+
 ## Usage
 
 Open `http://<son-pc-ip>:5987` from any browser on the LAN and log in
