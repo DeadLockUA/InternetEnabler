@@ -31,6 +31,7 @@ th, td { text-align: left; padding: .4rem .3rem; border-bottom: 1px solid var(--
 </head>
 <body>
 <h1>InternetEnabler</h1>
+<button class="action" id="btn-logout" style="float:right; margin-top:-2.6rem;">Log out</button>
 
 <nav class="tabs">
   <button data-tab="status" class="active">Status</button>
@@ -215,6 +216,12 @@ document.querySelectorAll("nav.tabs button").forEach(function (btn) {
 });
 
 $("btn-refresh").addEventListener("click", refreshStatus);
+$("btn-logout").addEventListener("click", async function () {
+  try {
+    await fetch("/logout", { method: "POST" });
+  } catch (e) { /* best effort - the cookie is cleared client-side below */ }
+  window.location.href = "/";
+});
 $("btn-block").addEventListener("click", async function () {
   if (!window.confirm("Block the internet now?")) return;
   try {

@@ -6,6 +6,7 @@ and listens for block/unblock/schedule/task commands from the parent's server.
 
 import json
 import os
+import sys
 import threading
 import time
 import traceback
@@ -15,12 +16,6 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from PIL import Image, ImageDraw
-import pystray
-
-import firewall
-import web_ui
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 SCHEDULE_PATH = os.path.join(BASE_DIR, "schedule.json")
@@ -29,6 +24,67 @@ HISTORY_PATH = os.path.join(BASE_DIR, "history.json")
 MESSAGES_PATH = os.path.join(BASE_DIR, "messages.json")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
 LOG_PATH = os.path.join(BASE_DIR, "agent.log")
+
+# Logging is initialized BEFORE the third-party imports below on purpose.
+# A missing dependency (pystray/Pillow) is the most common reason the agent
+# silently exits with code 1 under pythonw.exe, and without these helpers
+# running first that failure would never reach agent.log.
+MAX_LOG_BYTES = 1024 * 1024
+
+
+def _rotate_log_if_needed():
+    """Keep agent.log bounded (rename once > 1 MB) so a long-running agent
+    with frequent HTTP traffic or scheduler errors can't fill the disk."""
+    try:
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > MAX_LOG_BYTES:
+            rotated = f"{LOG_PATH}.1"
+            if os.path.exists(rotated):
+                os.remove(rotated)
+            os.replace(LOG_PATH, rotated)
+    except OSError:
+        pass
+
+
+def log(message):
+    _rotate_log_if_needed()
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
+
+
+def log_error(context, exc=False):
+    """Append an error line (and traceback, if called from an except block) to
+    agent.log. The agent runs via pythonw with no console, so this is the only
+    place operators can see handler/thread failures."""
+    _rotate_log_if_needed()
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now().isoformat(timespec='seconds')} ERROR {context}\n")
+        if exc:
+            f.write(traceback.format_exc())
+
+
+try:
+    from PIL import Image, ImageDraw
+except Exception:
+    log_error("FATAL failed to import PIL (Pillow) - is Pillow installed for this Python? See requirements.txt", exc=True)
+    raise
+
+try:
+    import pystray
+except Exception:
+    log_error("FATAL failed to import pystray - is pystray installed for this Python? See requirements.txt", exc=True)
+    raise
+
+try:
+    import firewall
+except Exception:
+    log_error("FATAL failed to import firewall - is firewall.py present next to agent.py?", exc=True)
+    raise
+
+try:
+    import web_ui
+except Exception:
+    log_error("FATAL failed to import web_ui - is web_ui.py present next to agent.py?", exc=True)
+    raise
 
 DEFAULT_REMINDER_MINUTES = 15
 HISTORY_RETENTION_DAYS = 400
@@ -51,24 +107,47 @@ def is_valid_time(value):
 # (e.g. on_enable) also hold it around a persistence call plus a firewall
 # call, so a plain Lock would deadlock on the nested acquisition.
 _lock = threading.RLock()
-_icon_ref = {"icon": None}
+# "blocked" caches the last known firewall state so the tray menu label and
+# icon updates never spawn PowerShell themselves (C1/M4). Updated only by the
+# 5 s refresh loop and the direct block/unblock paths.
+_icon_ref = {"icon": None, "blocked": None}
 
 
-def log_error(context, exc=False):
-    """Append an error line (and traceback, if called from an except block) to
-    agent.log. The agent runs via pythonw with no console, so this is the only
-    place operators can see handler/thread failures."""
-    with open(LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(f"{datetime.now().isoformat(timespec='seconds')} ERROR {context}\n")
-        if exc:
-            f.write(traceback.format_exc())
+def get_blocked_state():
+    """Last known block state (True/False/None). Never calls out to
+    PowerShell."""
+    with _lock:
+        return _icon_ref["blocked"]
+
+
+def set_blocked_state(value):
+    """Update the cached block state and repaint the tray icon/menu (best
+    effort, exception-safe). Never called with _lock held by the caller of a
+    code path that also acquires it. Takes _lock only to read the icon ref,
+    then releases before touching pystray."""
+    with _lock:
+        _icon_ref["blocked"] = value
+        icon = _icon_ref["icon"]
+    if icon is not None:
+        try:
+            icon.icon = make_icon_image(value)
+            icon.update_menu()
+        except Exception:
+            pass
 
 
 def _read_json(path, default):
     if not os.path.exists(path):
         return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (ValueError, OSError):
+        # A corrupt/truncated file (crash mid-write before os.replace, external
+        # edit) must not permanently kill the scheduler or take down an API -
+        # fall back to the default instead (M5).
+        log_error(f"ignoring unreadable/corrupt {path}, using defaults")
+        return default
 
 
 def _write_json(path, data):
@@ -254,8 +333,23 @@ class CommandHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _content_length(self):
+        """Content-Length parsed defensively; None for non-numeric or negative
+        values. A negative value must never reach rfile.read() - read(-1) on
+        some implementations reads until EOF (unbounded memory)."""
+        raw = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if length < 0:
+            return None
+        return length
+
     def _read_json_body(self):
-        length = int(self.headers.get("Content-Length", 0))
+        length = self._content_length()
+        if length is None or length > MAX_BODY_BYTES:
+            raise ValueError("invalid Content-Length")
         if length == 0:
             return {}
         return json.loads(self.rfile.read(length))
@@ -369,6 +463,7 @@ class CommandHandler(BaseHTTPRequestHandler):
                 days = int(qs.get("days", ["30"])[0])
             except ValueError:
                 days = 30
+            days = max(1, min(days, HISTORY_RETENTION_DAYS))
             cutoff = datetime.now() - timedelta(days=days)
             entries = [
                 e for e in load_history()
@@ -388,7 +483,10 @@ class CommandHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "internal error"})
 
     def _do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
+        length = self._content_length()
+        if length is None:
+            self._send_json(400, {"error": "invalid Content-Length"})
+            return
         if length > MAX_BODY_BYTES:
             self._send_json(413, {"error": "payload too large"})
             return
@@ -409,10 +507,12 @@ class CommandHandler(BaseHTTPRequestHandler):
             with _lock:
                 firewall.enable_block()
                 reset_tasks_done()
+            set_blocked_state(True)
             self._send_json(200, {"blocked": True})
         elif self.path == "/unblock":
             with _lock:
                 firewall.disable_block()
+            set_blocked_state(False)
             self._send_json(200, {"blocked": False})
         elif self.path in ("/schedule", "/api/schedule"):
             try:
@@ -455,14 +555,19 @@ class CommandHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def log_message(self, format, *args):
+        _rotate_log_if_needed()
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(f"{datetime.now().isoformat(timespec='seconds')} {self.address_string()} {format % args}\n")
 
 
-def run_http_server(config):
+def run_http_server(config, server=None):
+    """Serve HTTP until the process exits. When called from _main the server
+    is already bound (so a bind error is reported synchronously at startup);
+    when called standalone it creates its own server first."""
     try:
         CommandHandler.config = config
-        server = ThreadingHTTPServer(("0.0.0.0", config["port"]), CommandHandler)
+        if server is None:
+            server = ThreadingHTTPServer(("0.0.0.0", config["port"]), CommandHandler)
         server.serve_forever()
     except Exception:
         log_error("run_http_server crashed", exc=True)
@@ -523,6 +628,7 @@ def scheduler_tick(now=None):
             with _lock:
                 firewall.enable_block()
                 reset_tasks_done()
+            set_blocked_state(True)
             state["fired"].append(entry)
             state_changed = True
 
@@ -563,14 +669,16 @@ def on_enable(icon, item):
     with _lock:
         # Re-verify nothing changed while the (potentially long-running)
         # confirmation dialogs were up - a scheduled block firing mid-flow
-        # would reset_tasks_done() concurrently. If that happened, refuse to
-        # unblock rather than leaving the internet on with unconfirmed tasks.
-        if any(not t.get("done") for t in load_tasks()):
+        # would reset_tasks_done() concurrently, or the parent could replace
+        # the whole task list (including with an empty one). In either case
+        # refuse to unblock rather than leaving the internet on with
+        # unconfirmed tasks.
+        current = load_tasks()
+        if [t["id"] for t in current] != [t["id"] for t in tasks] or any(not t.get("done") for t in current):
             show_info("InternetEnabler", "Tasks changed while confirming - please try again.")
             return
         firewall.disable_block()
-    if icon is not None:
-        icon.icon = make_icon_image(False)
+    set_blocked_state(False)
 
 
 def on_view_tasks(icon, item):
@@ -603,8 +711,10 @@ def on_set_reminder(icon, item):
 
 def run_tray(config):
     def status_text(item):
-        with _lock:
-            blocked = firewall.is_blocked()
+        # Reads the cached state only - pystray may re-render the menu on
+        # hover/open/periodically, so this callback must never spawn
+        # PowerShell (C1/M4).
+        blocked = get_blocked_state()
         if blocked is None:
             return "Internet: UNKNOWN"
         return "Internet: BLOCKED" if blocked else "Internet: OK"
@@ -619,29 +729,69 @@ def run_tray(config):
 
     with _lock:
         initial_blocked = firewall.is_blocked()
+    _icon_ref["blocked"] = initial_blocked
     icon = pystray.Icon("InternetEnabler", make_icon_image(initial_blocked), "InternetEnabler", menu)
     _icon_ref["icon"] = icon
 
     def refresh_loop():
         while True:
-            with _lock:
-                blocked = firewall.is_blocked()
-            icon.icon = make_icon_image(blocked)
-            icon.update_menu()
-            time.sleep(5)
+            try:
+                # Sleep first: the startup path already queried the real
+                # state once, so avoid firing another PowerShell immediately.
+                time.sleep(5)
+                with _lock:
+                    blocked = firewall.is_blocked()
+                set_blocked_state(blocked)
+            except Exception:
+                # Any subprocess/firewall failure must NOT permanently kill
+                # this thread - the tray icon would freeze forever with no
+                # log entry (M2).
+                log_error("tray refresh failed", exc=True)
 
     threading.Thread(target=refresh_loop, daemon=True).start()
     icon.run()
 
 
 def main():
-    config = load_config()
-    firewall.ensure_rules(config["lan_subnet"], config["port"])
+    try:
+        _main()
+    except SystemExit:
+        raise
+    except Exception:
+        log_error("main crashed", exc=True)
+        sys.exit(1)
 
-    threading.Thread(target=run_http_server, args=(config,), daemon=True).start()
+
+def _main():
+    log(f"Starting InternetEnabler agent (python {sys.version.split()[0]}, {sys.executable})")
+    config = load_config()
+    log(f"config.json loaded (lan_subnet={config['lan_subnet']}, port={config['port']})")
+
+    port = config["port"]
+    if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+        log_error(f"invalid port {port!r} in config.json (expected an integer 1-65535)")
+        sys.exit(1)
+
+    firewall.ensure_rules(config["lan_subnet"], port)
+    log("firewall rules ensured")
+
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), CommandHandler)
+    except OSError:
+        log_error(
+            f"cannot bind HTTP server on port {port} "
+            "(address in use, or no permission for that port?)",
+            exc=True,
+        )
+        raise
+    log(f"HTTP server listening on port {server.server_address[1]}")
+
+    threading.Thread(target=run_http_server, args=(config, server), daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
+    log("scheduler thread started")
 
     run_tray(config)
+    log("agent terminated")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import http.client
 import json
+import os
 import threading
 import time
 from datetime import datetime, timedelta
@@ -19,6 +20,7 @@ def isolated_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "STATE_PATH", str(tmp_path / "state.json"))
     monkeypatch.setattr(agent, "LOG_PATH", str(tmp_path / "agent.log"))
     agent._icon_ref["icon"] = None
+    agent._icon_ref["blocked"] = None
     yield
 
 
@@ -233,6 +235,78 @@ def test_on_enable_aborts_if_tasks_reset_during_confirmation(monkeypatch):
     assert shown
 
 
+def test_on_enable_aborts_if_task_list_replaced_with_empty_during_confirmation(monkeypatch):
+    # M11: if the parent replaces the task list with an empty one mid-flow,
+    # load_tasks() returning [] must NOT satisfy the final guard (that would
+    # unblock without any task confirmation). Empty/unconfirmed = stay blocked.
+    agent.save_tasks([{"id": 1, "text": "Homework", "done": False}])
+    monkeypatch.setattr(agent.firewall, "is_blocked", lambda: True)
+    disabled = []
+    monkeypatch.setattr(agent.firewall, "disable_block", lambda: disabled.append(1))
+
+    def fake_ask(question):
+        agent.save_tasks([])  # parent replaced the list with an empty one
+        return True
+
+    monkeypatch.setattr(agent, "ask_yes_no", fake_ask)
+    shown = []
+    monkeypatch.setattr(agent, "show_info", lambda title, message: shown.append(message))
+
+    agent.on_enable(None, None)
+
+    assert disabled == []
+    assert shown
+
+
+# -- block-state cache (C1/M2/M4) ----------------------------------------
+
+def test_blocked_state_cache_defaults_to_none():
+    assert agent.get_blocked_state() is None
+
+
+def test_set_blocked_state_updates_cache_even_without_icon(monkeypatch):
+    agent._icon_ref["icon"] = None
+    monkeypatch.setattr(agent, "make_icon_image", lambda value: value)
+    agent.set_blocked_state(True)
+    assert agent.get_blocked_state() is True
+
+
+def test_set_blocked_state_repaints_icon_best_effort(monkeypatch):
+    calls = []
+
+    class FakeIcon:
+        def __init__(self):
+            self.icon = None
+        def update_menu(self):
+            calls.append("menu")
+
+    fake = FakeIcon()
+    agent._icon_ref["icon"] = fake
+    monkeypatch.setattr(agent, "make_icon_image", lambda value: ("img", value))
+
+    agent.set_blocked_state(False)
+
+    assert fake.icon == ("img", False)
+    assert calls == ["menu"]
+    assert agent.get_blocked_state() is False
+
+
+def test_set_blocked_state_tolerates_icon_exception(monkeypatch):
+    class BoomIcon:
+        @property
+        def icon(self):
+            return None
+
+        @icon.setter
+        def icon(self, value):
+            raise RuntimeError("boom")
+
+    agent._icon_ref["icon"] = BoomIcon()
+    monkeypatch.setattr(agent, "make_icon_image", lambda value: value)
+    agent.set_blocked_state(True)  # must not raise
+    assert agent.get_blocked_state() is True
+
+
 # -- scheduler_tick ---------------------------------------------------------
 
 def test_scheduler_tick_ignores_invalid_schedule_entries():
@@ -408,16 +482,61 @@ def test_post_rejects_oversized_body(server):
     assert status == 413
 
 
-def test_get_history_returns_500_and_logs_on_corrupt_file(server):
+def _raw_post(server, path, raw_headers, body=b""):
+    """POST with arbitrary raw headers (bypasses the json helper so invalid
+    Content-Length values can be sent literally)."""
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    conn.putrequest("POST", path)
+    conn.putheader("X-Auth-Token", "secret")
+    for k, v in raw_headers:
+        conn.putheader(k, v)
+    conn.endheaders()
+    if body:
+        conn.send(body)
+    resp = conn.getresponse()
+    payload = json.loads(resp.read().decode("utf-8"))
+    conn.close()
+    return resp.status, payload
+
+
+def test_post_rejects_non_numeric_content_length(server):
+    # M7: a non-numeric Content-Length must be a clean 400, not a logged 500.
+    status, payload = _raw_post(server, "/tasks", [("Content-Length", "abc")])
+    assert status == 400
+    assert payload == {"error": "invalid Content-Length"}
+
+
+def test_post_rejects_negative_content_length(server):
+    # M7: read(-1) can read until EOF (unbounded memory) - must be rejected.
+    status, payload = _raw_post(server, "/tasks", [("Content-Length", "-1")])
+    assert status == 400
+    assert payload == {"error": "invalid Content-Length"}
+
+
+def test_post_accepts_valid_content_length(server):
+    body = b'{"tasks": []}'
+    status, payload = _raw_post(
+        server, "/tasks", [("Content-Type", "application/json"),
+                           ("Content-Length", str(len(body)))],
+        body=body,
+    )
+    assert status == 200
+    assert payload == {"tasks": []}
+
+
+def test_get_history_recovers_from_corrupt_file(server):
+    # M5: a corrupt/truncated JSON file must not permanently take down the
+    # scheduler or 500 every API call - fall back to defaults and log a warning.
     with open(agent.HISTORY_PATH, "w", encoding="utf-8") as f:
         f.write("{not valid json")
 
     status, payload = server.request("GET", "/history")
 
-    assert status == 500
+    assert status == 200
+    assert payload == {"entries": []}
     with open(agent.LOG_PATH, "r", encoding="utf-8") as f:
         log_contents = f.read()
-    assert "history" in log_contents.lower() or "GET" in log_contents
+    assert "history" in log_contents.lower()
 
 
 def test_status_requires_auth(server):
@@ -514,6 +633,29 @@ def test_history_default_days(server):
     status, payload = server.request("GET", "/history")
     assert status == 200
     assert payload == {"entries": []}
+
+
+def test_history_days_clamped_to_range(server, monkeypatch):
+    # M8: negative/absurd days must be clamped, not produce empty results or
+    # an OverflowError->500 from timedelta.
+    old = (datetime.now() - timedelta(days=350)).isoformat(timespec="seconds")
+    recent = (datetime.now() - timedelta(hours=12)).isoformat(timespec="seconds")
+    with open(agent.HISTORY_PATH, "w", encoding="utf-8") as f:
+        json.dump({"entries": [
+            {"timestamp": old, "task": "Old", "event": "completed"},
+            {"timestamp": recent, "task": "Recent", "event": "completed"},
+        ]}, f)
+
+    # days=-30 clamps to 1 -> only within the last day
+    status, payload = server.request("GET", "/history?days=-30")
+    assert status == 200
+    assert [e["task"] for e in payload["entries"]] == ["Recent"]
+
+    # absurd days clamp to HISTORY_RETENTION_DAYS instead of OverflowError
+    status, payload = server.request("GET", f"/history?days={10**15}")
+    assert status == 200
+    tasks = [e["task"] for e in payload["entries"]]
+    assert tasks == ["Old", "Recent"]
 
 
 # -- web panel (login / sessions / api) ----------------------------------
@@ -681,3 +823,124 @@ def test_logout_invalidates_session(server):
     resp = conn.getresponse()
     conn.close()
     assert resp.status == 401
+
+
+# -- startup logging -------------------------------------------------------
+
+def test_log_writes_timestamped_line():
+    agent.log("hello world")
+    with open(agent.LOG_PATH, "r", encoding="utf-8") as f:
+        contents = f.read()
+    assert "hello world" in contents
+    assert contents.split()[0].count("-") == 2  # ISO date prefix e.g. 2026-08-03
+
+
+def test_log_rotates_when_over_limit():
+    # M10: agent.log must not grow without bound.
+    with open(agent.LOG_PATH, "w", encoding="utf-8") as f:
+        f.write("x" * (agent.MAX_LOG_BYTES + 1))
+    agent.log("after rotation")
+    assert os.path.exists(agent.LOG_PATH + ".1")
+    with open(agent.LOG_PATH, "r", encoding="utf-8") as f:
+        contents = f.read()
+    assert "after rotation" in contents
+
+
+def test_main_crashes_logs_traceback_and_exits_nonzero(monkeypatch):
+    # The whole point of the main() wrapper: a crash during startup (bad
+    # config, firewall failure, ...) must land in agent.log as a traceback
+    # instead of dying silently with exit code 1 under pythonw.
+    def boom():
+        raise RuntimeError("config bomb")
+
+    monkeypatch.setattr(agent, "_main", boom)
+
+    with pytest.raises(SystemExit) as excinfo:
+        agent.main()
+
+    assert excinfo.value.code == 1
+    with open(agent.LOG_PATH, "r", encoding="utf-8") as f:
+        contents = f.read()
+    assert "main crashed" in contents
+    assert "config bomb" in contents
+    assert "Traceback" in contents
+
+
+def test_main_logs_startup_milestones(monkeypatch):
+    # A healthy startup should record the milestones so operators can see how
+    # far the agent got. run_tray normally blocks forever, so stop the fake
+    # startup by raising SystemExit(0) from it - SystemExit propagates through
+    # main()'s except Exception handler unchanged (graceful termination, no
+    # error logging, exit code 0).
+    agent.save_config({
+        "token": "t",
+        "web_password": "p",
+        "lan_subnet": "192.168.1.0/24",
+        "port": 5999,
+    })
+    monkeypatch.setattr(agent.firewall, "ensure_rules", lambda lan_subnet, port: None)
+
+    def fake_tray(config):
+        raise SystemExit(0)
+
+    monkeypatch.setattr(agent, "run_tray", fake_tray)
+    # Don't actually bind a socket or start threads in the unit test.
+    monkeypatch.setattr(agent, "ThreadingHTTPServer", lambda *a, **k: type("S", (), {"server_address": (None, 5999)})())
+    monkeypatch.setattr(agent.threading.Thread, "start", lambda self: None)
+
+    with pytest.raises(SystemExit) as excinfo:
+        agent.main()
+    assert excinfo.value.code == 0
+
+    with open(agent.LOG_PATH, "r", encoding="utf-8") as f:
+        contents = f.read()
+    assert "Starting InternetEnabler agent" in contents
+    assert "config.json loaded" in contents
+    assert "firewall rules ensured" in contents
+    assert "HTTP server listening" in contents
+    assert "scheduler thread started" in contents
+
+
+def test_http_server_bind_failure_logged(monkeypatch):
+    # Binding the HTTP server is done synchronously in _main() so a port
+    # conflict is reported clearly instead of killing a background thread.
+    agent.save_config({
+        "token": "t",
+        "web_password": "p",
+        "lan_subnet": "192.168.1.0/24",
+        "port": 5999,
+    })
+    monkeypatch.setattr(agent.firewall, "ensure_rules", lambda lan_subnet, port: None)
+
+    def fake_bind(*args, **kwargs):
+        raise OSError("address already in use")
+
+    monkeypatch.setattr(agent, "ThreadingHTTPServer", fake_bind)
+
+    with pytest.raises(SystemExit) as excinfo:
+        agent.main()
+
+    assert excinfo.value.code == 1
+    with open(agent.LOG_PATH, "r", encoding="utf-8") as f:
+        contents = f.read()
+    assert "cannot bind HTTP server" in contents
+    assert "address already in use" in contents
+
+
+def test_main_rejects_out_of_range_port(monkeypatch):
+    # M9: an out-of-range port must fail with the clear "invalid port" message
+    # instead of an OverflowError traceback from ThreadingHTTPServer.
+    agent.save_config({
+        "token": "t",
+        "web_password": "p",
+        "lan_subnet": "192.168.1.0/24",
+        "port": 99999,
+    })
+
+    with pytest.raises(SystemExit) as excinfo:
+        agent.main()
+
+    assert excinfo.value.code == 1
+    with open(agent.LOG_PATH, "r", encoding="utf-8") as f:
+        contents = f.read()
+    assert "invalid port" in contents

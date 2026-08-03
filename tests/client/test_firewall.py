@@ -1,4 +1,6 @@
 import ipaddress
+import subprocess
+import sys
 
 import pytest
 
@@ -101,7 +103,7 @@ def test_ensure_rules_creates_missing_rules(monkeypatch):
     assert f'name="{firewall.BLOCK_RULE_NAME_V6}"' in block_v6_call
     assert "dir=out" in block_v6_call
     assert "action=block" in block_v6_call
-    assert "remoteip=::/0" in block_v6_call
+    assert "remoteip=::/1,8000::/1" in block_v6_call
     assert f'name="{firewall.INBOUND_RULE_NAME}"' in inbound_call
     assert "dir=in" in inbound_call
     assert "localport=5987" in inbound_call
@@ -188,3 +190,48 @@ def test_is_blocked_none_on_nonzero_exit(monkeypatch):
 def test_is_blocked_none_on_unexpected_output(monkeypatch):
     monkeypatch.setattr(firewall, "_run_ps", _fake_run_ps(0, "True False"))
     assert firewall.is_blocked() is None
+
+
+# -- C1: subprocesses must never flash a console window --------------------
+
+def test_run_uses_create_no_window_flag(monkeypatch, tmp_path):
+    seen = {}
+
+    def spy_run(args, **kwargs):
+        seen.update(kwargs)
+        raise SystemExit  # stop before actually spawning a process
+
+    monkeypatch.setattr(subprocess, "run", spy_run)
+    monkeypatch.setattr(sys, "platform", "win32")
+    try:
+        firewall._run(["show", "rule"])
+    except SystemExit:
+        pass
+    assert seen.get("creationflags") == firewall.CREATE_NO_WINDOW
+
+
+def test_run_ps_uses_create_no_window_flag(monkeypatch):
+    seen = {}
+
+    def spy_run(args, **kwargs):
+        seen.update(kwargs)
+        raise SystemExit  # stop before actually spawning a process
+
+    monkeypatch.setattr(subprocess, "run", spy_run)
+    monkeypatch.setattr(sys, "platform", "win32")
+    try:
+        firewall._run_ps("Write-Output 1")
+    except SystemExit:
+        pass
+    assert seen.get("creationflags") == firewall.CREATE_NO_WINDOW
+
+
+def test_create_no_window_flag_is_zero_on_non_windows(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    import importlib
+    importlib.reload(firewall)
+    try:
+        assert firewall.CREATE_NO_WINDOW == 0
+    finally:
+        monkeypatch.setattr(sys, "platform", "win32")
+        importlib.reload(firewall)

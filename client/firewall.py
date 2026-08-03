@@ -7,10 +7,16 @@ machine (and this machine can still answer) while internet access is cut.
 
 import ipaddress
 import subprocess
+import sys
 
 BLOCK_RULE_NAME = "InternetEnabler-Block"
 BLOCK_RULE_NAME_V6 = "InternetEnabler-Block-IPv6"
 INBOUND_RULE_NAME = "InternetEnabler-Inbound"
+
+# The agent runs under pythonw.exe (no console). Spawning a console app like
+# netsh/powershell without this flag makes Windows flash a new console window
+# for every call; CREATE_NO_WINDOW keeps those subprocesses invisible.
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 
 def _run(args):
@@ -19,6 +25,7 @@ def _run(args):
         capture_output=True,
         text=True,
         shell=False,
+        creationflags=CREATE_NO_WINDOW,
     )
     return result.returncode, result.stdout, result.stderr
 
@@ -35,6 +42,7 @@ def _run_ps(command):
         capture_output=True,
         text=True,
         shell=False,
+        creationflags=CREATE_NO_WINDOW,
     )
     return result.returncode, result.stdout.strip(), result.stderr
 
@@ -92,14 +100,14 @@ def ensure_rules(lan_subnet, port):
             "dir=out",
             "action=block",
             "enable=no",
-            "remoteip=::/0",
+            "remoteip=::/1,8000::/1",
         ])
         if code != 0:
             raise RuntimeError(f"Failed to create IPv6 block rule: {err or out}")
     else:
         code, out, err = _run([
             "advfirewall", "firewall", "set", "rule",
-            f'name="{BLOCK_RULE_NAME_V6}"', "new", "remoteip=::/0",
+            f'name="{BLOCK_RULE_NAME_V6}"', "new", "remoteip=::/1,8000::/1",
         ])
         if code != 0:
             raise RuntimeError(f"Failed to update IPv6 block rule: {err or out}")

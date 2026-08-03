@@ -22,12 +22,22 @@ _sessions = {}   # sid -> {"expires": unix_ts}
 _failures = {}   # ip -> {"count": int, "window_start": unix_ts}
 
 
+def _prune_expired(now):
+    """Drop expired sessions. Called under _lock on every session creation so
+    arbitrary LAN hosts can't grow _sessions without bound by sending random
+    ie_session cookie values (the HTTP server listens on 0.0.0.0)."""
+    expired = [sid for sid, entry in _sessions.items() if now > entry["expires"]]
+    for sid in expired:
+        del _sessions[sid]
+
+
 def create_session(now=None):
     """Create a new session and return its id (renewed on each valid use)."""
     if now is None:
         now = time.time()
     sid = secrets.token_hex(16)
     with _lock:
+        _prune_expired(now)
         _sessions[sid] = {"expires": now + SESSION_TTL_SECONDS}
     return sid
 
@@ -87,7 +97,12 @@ def check_login(ip, password, config, now=None):
             return {"ok": True}
 
         count = (failure["count"] if failure else 0) + 1
-        _failures[ip] = {"count": count, "window_start": now}
+        # Keep the ORIGINAL window_start so the lockout window has a fixed
+        # endpoint. Resetting it to `now` on every failed attempt would let a
+        # sustained attacker (or the whole household behind one NAT) extend the
+        # window forever and make the lockout effectively permanent.
+        window_start = (failure["window_start"] if failure else now)
+        _failures[ip] = {"count": count, "window_start": window_start}
         if count >= LOCKOUT_THRESHOLD:
             retry_after = int(FAILURE_WINDOW_SECONDS)
             return {
