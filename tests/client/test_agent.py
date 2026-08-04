@@ -1,6 +1,8 @@
 import http.client
 import json
 import os
+import queue
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -256,6 +258,230 @@ def test_on_enable_aborts_if_task_list_replaced_with_empty_during_confirmation(m
 
     assert disabled == []
     assert shown
+
+
+def test_on_enable_does_not_record_skip_when_confirmation_dialog_fails(monkeypatch):
+    # A dialog-thread failure (e.g. a dead worker) is not the same as the son
+    # answering "no": on_enable must not write a "skipped" history entry for
+    # a task he was never actually asked about, and must not unblock either.
+    agent.save_tasks([{"id": 1, "text": "Homework", "done": False}])
+    monkeypatch.setattr(agent.firewall, "is_blocked", lambda: True)
+    disabled = []
+    monkeypatch.setattr(agent.firewall, "disable_block", lambda: disabled.append(1))
+
+    def failing_ask(question):
+        raise RuntimeError("dialog thread is not running")
+
+    monkeypatch.setattr(agent, "ask_yes_no", failing_ask)
+
+    agent.on_enable(None, None)  # must not raise - _safe_tray_action swallows it
+
+    assert disabled == []
+    assert agent.load_history() == []
+    assert agent.load_tasks()[0]["done"] is False
+
+
+def test_safe_tray_action_logs_failure_instead_of_raising():
+    @agent._safe_tray_action
+    def boom(icon, item):
+        raise ValueError("kaboom")
+
+    boom(None, None)  # must not raise
+
+    with open(agent.LOG_PATH) as f:
+        assert "kaboom" in f.read()
+
+
+# -- dialogs ---------------------------------------------------------------
+
+def _drain_dialog_queue():
+    """Fake _dialog_worker that never touches Tk; pumps the request queue."""
+    while True:
+        result_q, kind, call = agent._dialog_requests.get()
+        try:
+            result_q.put(agent._tk_call(kind, call, None))
+        except Exception as exc:
+            result_q.put(exc)
+
+
+def _fake_dialog_thread(monkeypatch):
+    """Point the dialog-thread machinery at the fake drain worker."""
+    monkeypatch.setattr(agent, "_dialog_requests", queue.Queue())
+    monkeypatch.setattr(agent, "_dialog_thread", None)
+    monkeypatch.setattr(agent, "_dialog_worker", _drain_dialog_queue)
+
+
+def test_show_info_uses_native_message_box_on_windows(monkeypatch):
+    # D1: on Windows the "View Tasks" / "View Messages" dialogs must use the
+    # native Win32 MessageBoxW, deferred to the dialog thread (never shown
+    # synchronously inside pystray's DispatchMessage).
+    _fake_dialog_thread(monkeypatch)
+    calls = []
+    monkeypatch.setattr(agent, "_native_message_box",
+                        lambda title, message, flags: calls.append((title, message, flags)) or 0)
+    agent.show_info("Your Tasks", "No tasks assigned.")
+    assert calls == [("Your Tasks", "No tasks assigned.",
+                      agent._MB_ICONINFORMATION | agent._MB_OK)]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="uses ctypes.windll (Windows only)")
+def test_native_message_box_forces_topmost_and_foreground(monkeypatch):
+    # The native box is forced to the foreground so its OK/X buttons are
+    # clickable even right after the tray menu's foreground hand-off.
+    class FakeUser32:
+        def __init__(self):
+            self.boxes = []
+
+        def MessageBoxW(self, hwnd, text, title, flags):
+            self.boxes.append((hwnd, text, title, flags))
+            return agent._IDYES
+
+    fake = FakeUser32()
+    monkeypatch.setattr(agent.ctypes.windll, "user32", fake)
+    result = agent._native_message_box("T", "M", agent._MB_ICONINFORMATION | agent._MB_OK)
+    assert result == agent._IDYES
+    hwnd, text, title, flags = fake.boxes[0]
+    assert flags & agent._MB_TOPMOST
+    assert flags & agent._MB_SETFOREGROUND
+    assert flags & agent._MB_ICONINFORMATION
+
+
+def test_show_info_falls_back_to_tk_off_windows(monkeypatch):
+    monkeypatch.setattr(agent, "_WIN32", False)
+    _fake_dialog_thread(monkeypatch)
+    tk_boxes = []
+    monkeypatch.setattr(agent.messagebox, "showinfo",
+                        lambda *a, **k: tk_boxes.append(a))
+    agent.show_info("T", "M")
+    assert tk_boxes == [("T", "M")]
+
+
+def test_ask_yes_no_yes_returns_true(monkeypatch):
+    _fake_dialog_thread(monkeypatch)
+    monkeypatch.setattr(agent, "_native_message_box",
+                        lambda title, message, flags: agent._IDYES)
+    assert agent.ask_yes_no("Was the task complete?") is True
+
+
+def test_ask_yes_no_no_returns_false(monkeypatch):
+    _fake_dialog_thread(monkeypatch)
+    monkeypatch.setattr(agent, "_native_message_box",
+                        lambda title, message, flags: agent._IDYES + 1)  # IDNO
+    assert agent.ask_yes_no("Was the task complete?") is False
+
+
+def test_ask_yes_no_falls_back_to_tk_off_windows(monkeypatch):
+    monkeypatch.setattr(agent, "_WIN32", False)
+    _fake_dialog_thread(monkeypatch)
+    monkeypatch.setattr(agent.messagebox, "askyesno",
+                        lambda *a, **k: True)
+    assert agent.ask_yes_no("Q") is True
+
+
+def test_run_dialog_runs_request_on_dialog_thread(monkeypatch):
+    # D2: dialogs run on the dedicated dialog thread (never inside the tray's
+    # DispatchMessage), and the result comes back.
+    _fake_dialog_thread(monkeypatch)
+    seen = {}
+
+    def record(root):
+        seen["thread_name"] = threading.current_thread().name
+        return 42
+
+    result = agent._run_dialog(agent._TKCUSTOM, record)
+    assert result == 42
+    assert seen["thread_name"] == "ie-dialog"
+
+
+def test_run_dialog_raises_when_dialog_thread_is_dead(monkeypatch):
+    # A dead dialog thread (e.g. headless session with no display) must be
+    # reported instead of hanging the tray callback forever.
+    monkeypatch.setattr(agent, "_dialog_requests", queue.Queue())
+    monkeypatch.setattr(agent, "_dialog_thread", None)
+
+    def dead_worker():
+        return  # exits immediately
+
+    monkeypatch.setattr(agent, "_dialog_worker", dead_worker)
+    with pytest.raises(RuntimeError):
+        agent._run_dialog(agent._TKCUSTOM, lambda root: 1)
+
+
+def test_ensure_dialog_thread_restarts_after_thread_dies(monkeypatch):
+    # A dialog thread that exits (e.g. root creation failed) must be replaced
+    # on the next request, not left as a permanently dead reference that
+    # bricks every future tray action.
+    monkeypatch.setattr(agent, "_dialog_thread", None)
+    starts = []
+
+    def short_lived_worker():
+        starts.append(1)  # exits immediately
+
+    monkeypatch.setattr(agent, "_dialog_worker", short_lived_worker)
+
+    t1 = agent._ensure_dialog_thread()
+    t1.join(timeout=1)
+    assert not t1.is_alive()
+
+    t2 = agent._ensure_dialog_thread()
+    assert t2 is not t1
+    assert len(starts) == 2
+
+
+def test_dialog_worker_survives_a_failed_request_and_needs_no_tk_for_native(monkeypatch):
+    # F: the worker must not die on a single bad request (unlike the old
+    # eager-Tk-at-startup version), and the native MessageBoxW path must not
+    # be gated on Tk succeeding, since it doesn't use Tk at all.
+    monkeypatch.setattr(agent, "_dialog_requests", queue.Queue())
+    monkeypatch.setattr(agent, "_dialog_thread", None)
+    monkeypatch.setattr(agent, "_DIALOG_STARTUP_DELAY_SECONDS", 0)
+
+    tk_calls = []
+
+    def failing_tk():
+        tk_calls.append(1)
+        raise RuntimeError("no display")
+
+    monkeypatch.setattr(agent.tk, "Tk", failing_tk)
+
+    with pytest.raises(RuntimeError):
+        agent._run_dialog(agent._TKCUSTOM, lambda root: 1)
+
+    # The same (still-alive) worker thread must go on to serve a NATIVE
+    # request without ever touching Tk.
+    result = agent._run_dialog(agent._NATIVE, lambda: agent._IDYES)
+    assert result == agent._IDYES
+    assert tk_calls == [1]
+
+
+def test_run_dialog_pumps_win32_messages_while_waiting(monkeypatch):
+    # F: _run_dialog blocks the pystray message-loop thread; it must keep
+    # pumping Win32 messages (WM_TASKBARCREATED etc.) while a dialog is up
+    # instead of leaving the tray unresponsive to the shell.
+    monkeypatch.setattr(agent, "_WIN32", True)
+    pumped = []
+    monkeypatch.setattr(agent, "_pump_pending_messages", lambda: pumped.append(1))
+    monkeypatch.setattr(agent, "_dialog_requests", queue.Queue())
+    monkeypatch.setattr(agent, "_dialog_thread", None)
+    monkeypatch.setattr(agent, "_DIALOG_POLL_TIMEOUT_SECONDS", 0.01)
+
+    def slow_worker():
+        result_q, kind, call = agent._dialog_requests.get()
+        time.sleep(0.05)
+        result_q.put(call(None))
+
+    monkeypatch.setattr(agent, "_dialog_worker", slow_worker)
+
+    result = agent._run_dialog(agent._TKCUSTOM, lambda root: 99)
+
+    assert result == 99
+    assert pumped
+
+
+def test_ask_reminder_minutes_uses_dialog_thread(monkeypatch):
+    _fake_dialog_thread(monkeypatch)
+    monkeypatch.setattr(agent.simpledialog, "askinteger", lambda *a, **k: 30)
+    assert agent.ask_reminder_minutes(15) == 30
 
 
 # -- block-state cache (C1/M2/M4) ----------------------------------------

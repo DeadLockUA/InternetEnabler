@@ -4,8 +4,12 @@ Runs in the background (tray icon), enforces a daily block schedule,
 and listens for block/unblock/schedule/task commands from the parent's server.
 """
 
+import ctypes
+from ctypes import wintypes
+import functools
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -281,42 +285,225 @@ def make_icon_image(blocked):
     return img
 
 
-def _dialog_root():
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    return root
+# --- Dialogs ---------------------------------------------------------------
+#
+# The tray menu callbacks (on_view_tasks / on_view_messages / on_enable /
+# on_set_reminder) are invoked by pystray *synchronously inside the Win32
+# message loop*: TrackPopupMenuEx returns the selected item, then the callback
+# fires from the WM_NOTIFY handler, which runs inside the tray window's WndProc,
+# which was entered from DispatchMessage. The popup menu is also still closing
+# and handing the foreground back to the previously-active window at that
+# moment.
+#
+# Showing ANY modal dialog synchronously from such a callback is unsafe, for
+# two independent reasons:
+#   1. Tkinter: messagebox.showinfo() starts a NESTED Tk event loop on the
+#      very thread that is still executing the WndProc, so the dialog never
+#      receives its input correctly - the OK button is unclickable and the X
+#      button cannot close it.
+#   2. Even a native MessageBoxW launched at that exact moment can be painted
+#      WITHOUT ever becoming active (Windows foreground/hit-test state is still
+#      mid-hand-off), so a native box can show the same dead OK/X symptoms.
+#
+# The robust fix for both: NEVER show a modal from the tray thread. Every
+# dialog is submitted to a single dedicated worker thread and shown only after
+# a short startup delay (enough for the menu teardown and foreground hand-off
+# to finish). Native boxes additionally use MB_TOPMOST | MB_SETFOREGROUND so
+# they reliably activate. The tray callback simply blocks for the result.
+
+_DIALOG_STARTUP_DELAY_SECONDS = 0.12   # let the tray menu teardown/foreground hand-off finish
+_DIALOG_POLL_TIMEOUT_SECONDS = 0.25
+_WIN32 = sys.platform == "win32"
+
+_MB_OK = 0x00000000
+_MB_YESNO = 0x00000004
+_MB_ICONQUESTION = 0x00000020
+_MB_ICONINFORMATION = 0x00000040
+_MB_TOPMOST = 0x00040000
+_MB_SETFOREGROUND = 0x00010000
+_IDYES = 6
+
+_NATIVE = 0      # native Win32 MessageBoxW
+_TKINFO = 1      # tkinter messagebox.showinfo (non-Windows fallback)
+_TKYESNO = 2     # tkinter messagebox.askyesno (non-Windows fallback)
+_TKCUSTOM = 3    # arbitrary callable(root) on the dialog thread
+
+
+def _native_message_box(title, message, flags):
+    """Run a native Win32 modal message box and return the pressed button id.
+
+    Windows only. Must be called on the dedicated dialog thread, after the
+    short startup delay, i.e. NOT synchronously from inside a pystray menu
+    callback: MessageBoxW launched while TrackPopupMenuEx is still unwinding
+    (and the foreground is being handed back) can be drawn without ever
+    becoming active, leaving its OK/X buttons unclickable.
+    """
+    # MB_TOPMOST | MB_SETFOREGROUND force the box to the front AND activate
+    # it, so it reliably receives input even right after a foreground hand-off.
+    return ctypes.windll.user32.MessageBoxW(
+        0, message, title, flags | _MB_TOPMOST | _MB_SETFOREGROUND)
+
+
+_PM_REMOVE = 0x0001
+
+
+def _pump_pending_messages():
+    """Drain this thread's Win32 message queue without blocking.
+
+    Called from _run_dialog's wait loop, which runs on pystray's own
+    message-loop thread: that thread's GetMessage loop cannot turn while
+    we're blocked here, so without this pump the tray would stop reacting to
+    the shell (e.g. WM_TASKBARCREATED after an Explorer restart) for as long
+    as a dialog is open.
+    """
+    msg = wintypes.MSG()
+    lpmsg = ctypes.byref(msg)
+    while ctypes.windll.user32.PeekMessageW(lpmsg, None, 0, 0, _PM_REMOVE):
+        ctypes.windll.user32.TranslateMessage(lpmsg)
+        ctypes.windll.user32.DispatchMessageW(lpmsg)
+
+
+def _tk_call(kind, call, root):
+    """Run one dialog call on the dialog thread; returns the result.
+
+    * native boxes (kind == _NATIVE): *call* is a zero-arg closure that runs
+      MessageBoxW - no Tk involved, the Tk root is ignored.
+    * Tk messagebox kinds: *call* is an (title, message) tuple.
+    * custom (kind == _TKCUSTOM): *call* is callable(root).
+    """
+    if kind == _NATIVE:
+        return call()
+    if kind == _TKINFO:
+        messagebox.showinfo(call[0], call[1], parent=root)
+        return None
+    if kind == _TKYESNO:
+        return messagebox.askyesno(call[0], call[1], parent=root)
+    return call(root)
+
+
+# --- Dedicated dialog thread ----------------------------------------------
+#
+# Every dialog (native MessageBoxW, non-Windows Tk fallback, and the Tk input
+# dialog) runs on ONE worker thread. Two reasons:
+#   1. A modal dialog must NOT be opened synchronously inside a pystray menu
+#      callback (which executes inside the tray window's WndProc within
+#      DispatchMessage). Even a native MessageBoxW shown there can be painted
+#      without being activated, so OK/X never respond. Deferring onto this
+#      thread by ~0.12 s lets the menu teardown and foreground hand-off finish
+#      first.
+#   2. Tkinter requires all Tk widget work on a single thread.
+
+_dialog_requests = queue.Queue()   # (result_queue, kind, call)
+_dialog_thread = None
+_dialog_thread_lock = threading.Lock()
+
+
+def _dialog_worker():
+    """The single thread that owns the Tk root and runs every dialog.
+
+    The Tk root is created lazily (only once a Tk-kind request actually
+    arrives), so a broken Tcl/Tk install does not block the native
+    MessageBoxW path (_NATIVE), which needs no Tk at all. Both root creation
+    and each dialog call are scoped per-request: a single failure is reported
+    back to that caller and logged, but this loop - and thus the thread -
+    never exits, so a bad request can't permanently brick every future tray
+    action the way a dead worker thread would.
+    """
+    root = None
+    while True:
+        result_q, kind, call = _dialog_requests.get()
+        try:
+            time.sleep(_DIALOG_STARTUP_DELAY_SECONDS)
+            if kind != _NATIVE and root is None:
+                root = tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+            result_q.put(_tk_call(kind, call, root))
+        except Exception as exc:
+            log_error("dialog failed on dialog thread", exc=True)
+            result_q.put(exc)
+
+
+def _ensure_dialog_thread():
+    global _dialog_thread
+    if _dialog_thread is not None and _dialog_thread.is_alive():
+        return _dialog_thread
+    with _dialog_thread_lock:
+        if _dialog_thread is None or not _dialog_thread.is_alive():
+            thread = threading.Thread(
+                target=_dialog_worker, name="ie-dialog", daemon=True)
+            thread.start()
+            _dialog_thread = thread
+        return _dialog_thread
+
+
+def _run_dialog(kind, call):
+    """Submit *call* to the dialog thread and block for its result.
+
+    The caller (e.g. a pystray menu callback on the main thread) blocks here;
+    the modal itself opens on the dialog thread AFTER the startup delay, so it
+    is never shown inside the tray's DispatchMessage. While waiting, pumps
+    any pending Win32 messages for this thread (WM_TASKBARCREATED, repaints):
+    this call runs on the same thread as pystray's own GetMessage loop, and
+    that loop cannot run again until this call returns, so without this the
+    tray icon would stop responding to the shell for as long as the dialog is
+    open. Polls so a dead dialog thread is reported instead of hanging
+    forever, and restarts it (via _ensure_dialog_thread) rather than staying
+    stuck for the remainder of the process.
+    """
+    thread = _ensure_dialog_thread()
+    result_q = queue.Queue()
+    _dialog_requests.put((result_q, kind, call))
+    while True:
+        try:
+            result = result_q.get(timeout=_DIALOG_POLL_TIMEOUT_SECONDS)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+        except queue.Empty:
+            if _WIN32:
+                _pump_pending_messages()
+            if not thread.is_alive():
+                raise RuntimeError("dialog thread is not running")
 
 
 def ask_yes_no(question):
-    root = _dialog_root()
-    try:
-        return messagebox.askyesno("InternetEnabler", question, parent=root)
-    finally:
-        root.destroy()
+    if _WIN32:
+        result = _run_dialog(
+            _NATIVE,
+            lambda: _native_message_box(
+                "InternetEnabler",
+                question,
+                _MB_ICONQUESTION | _MB_YESNO,
+            ),
+        )
+        return result == _IDYES
+    return _run_dialog(_TKYESNO, ("InternetEnabler", question))
 
 
 def show_info(title, message):
-    root = _dialog_root()
-    try:
-        messagebox.showinfo(title, message, parent=root)
-    finally:
-        root.destroy()
+    if _WIN32:
+        _run_dialog(
+            _NATIVE,
+            lambda: _native_message_box(
+                title, message, _MB_ICONINFORMATION | _MB_OK),
+        )
+        return
+    _run_dialog(_TKINFO, (title, message))
 
 
 def ask_reminder_minutes(current):
-    root = _dialog_root()
-    try:
-        return simpledialog.askinteger(
+    return _run_dialog(
+        _TKCUSTOM,
+        lambda root: simpledialog.askinteger(
             "InternetEnabler",
             "Remind me this many minutes before internet is blocked:",
             initialvalue=current,
             minvalue=0,
             maxvalue=180,
             parent=root,
-        )
-    finally:
-        root.destroy()
+        ),
+    )
 
 
 class CommandHandler(BaseHTTPRequestHandler):
@@ -645,10 +832,33 @@ def run_scheduler():
         time.sleep(20)
 
 
+def _safe_tray_action(func):
+    """Log a tray menu callback's failure instead of losing it.
+
+    pystray catches whatever a menu callback raises and reports it to a
+    stdlib `logging` logger that this project never configures a handler
+    for, so under pythonw.exe (no console) an uncaught exception here - e.g.
+    _run_dialog surfacing a dead dialog thread - vanishes with no trace in
+    agent.log. This puts it there.
+    """
+    @functools.wraps(func)
+    def wrapper(icon, item):
+        try:
+            func(icon, item)
+        except Exception:
+            log_error(f"tray action '{func.__name__}' failed", exc=True)
+    return wrapper
+
+
+@_safe_tray_action
 def on_enable(icon, item):
     """Enable-Internet tray action: gate on confirming every pending task.
 
     Module-level (not a run_tray closure) so it's directly unit-testable.
+    If a confirmation dialog itself fails (as opposed to the son answering
+    "no"), ask_yes_no now raises instead of silently returning False, so
+    this aborts without writing a bogus "skipped" history entry for a task
+    he was never actually asked about.
     """
     with _lock:
         blocked = firewall.is_blocked()
@@ -681,6 +891,7 @@ def on_enable(icon, item):
     set_blocked_state(False)
 
 
+@_safe_tray_action
 def on_view_tasks(icon, item):
     tasks = load_tasks()
     if not tasks:
@@ -690,6 +901,7 @@ def on_view_tasks(icon, item):
     show_info("Your Tasks", "\n".join(lines))
 
 
+@_safe_tray_action
 def on_view_messages(icon, item):
     messages = load_messages()
     if not messages:
@@ -699,6 +911,7 @@ def on_view_messages(icon, item):
     show_info("Messages", "\n".join(lines))
 
 
+@_safe_tray_action
 def on_set_reminder(icon, item):
     config = load_config()
     current = config.get("reminder_minutes", DEFAULT_REMINDER_MINUTES)
